@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/drums-core", "crates/drums-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["DRUMS contributors"]
+description = "Open-source MIDI drum practice application."
+
+[workspace.dependencies]
+midir = "0.10"
+eframe = "0.31"
+drums-core = { path = "crates/drums-core" }
