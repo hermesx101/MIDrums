@@ -17,6 +17,7 @@
 
 mod mapping_ui;
 mod midi_file_ui;
+mod click_audio;
 mod wizard_ui;
 
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use std::time::Instant;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Timeline};
+use drums_core::{Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Subdivision, Timeline};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -80,6 +81,9 @@ struct DrumApp {
     transport: Option<MusicalTransport>,
     timeline: Option<Timeline>,
     last_transport_update: Instant,
+    metronome: Metronome,
+    metronome_enabled: bool,
+    click_audio: click_audio::ClickAudio,
 }
 
 impl DrumApp {
@@ -124,6 +128,9 @@ impl DrumApp {
             transport: None,
             timeline: None,
             last_transport_update: Instant::now(),
+            metronome: Metronome::new(Subdivision::Eighth),
+            metronome_enabled: false,
+            click_audio: click_audio::ClickAudio::new(),
         }
     }
 
@@ -205,6 +212,7 @@ impl DrumApp {
                 self.transport = Some(MusicalTransport::from_midi_file(&file));
                 self.imported_midi = Some(file);
                 self.rebuild_timeline();
+                self.metronome.reset();
                 self.midi_import_error = None;
                 self.last_transport_update = Instant::now();
                 self.view = View::MidiInspection;
@@ -249,6 +257,11 @@ impl eframe::App for DrumApp {
         self.last_transport_update = now;
         if let Some(transport) = self.transport.as_mut() {
             transport.advance_by(elapsed);
+            if self.metronome_enabled {
+                for event in self.metronome.observe(transport) { self.click_audio.play(event.kind); }
+            } else {
+                self.metronome.sync_to_transport(transport);
+            }
             if transport.is_playing() {
                 // Rendering is not the clock: this only schedules a future
                 // frame so the elapsed monotonic-time transport can be shown.

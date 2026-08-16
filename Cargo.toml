@@ -16,4 +16,5 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 midly = "0.5"
 rfd = "0.15"
+rodio = "0.20"
 drums-core = { path = "crates/drums-core" }

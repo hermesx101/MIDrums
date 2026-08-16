@@ -1,6 +1,6 @@
 //! Phase 3A MIDI-file inspection view. Parsing remains in `drums-core`.
 
-use drums_core::{MidiFile, MidiTiming};
+use drums_core::{count_tokens, MidiFile, MidiTiming, Subdivision, TransportState};
 use eframe::egui;
 use crate::{DrumApp, View};
 
@@ -21,6 +21,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let Some(selected_track) = app.selected_drum_track else { ui.weak("Select a track above."); return; };
     let expected = file.expected_notes_for_track(selected_track, app.active_config.as_ref());
     transport_controls(app, ui);
+    metronome_controls(app, ui);
     if expected.is_empty() { ui.weak("This track contains no Note On events with velocity above zero."); return; }
     egui::Grid::new("midi_file_events").striped(true).num_columns(7).spacing([16.0, 4.0]).show(ui, |ui| {
         ui.strong("Time"); ui.strong("Tick"); ui.strong("MIDI"); ui.strong("Component"); ui.strong("Target"); ui.strong("Velocity"); ui.strong("Channel"); ui.end_row();
@@ -45,15 +46,15 @@ fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.heading("TRANSPORT");
     ui.horizontal(|ui| {
-        if ui.button("Play").clicked() { transport.play(); }
-        if ui.button("Pause").clicked() { transport.pause(); }
-        if ui.button("Stop").clicked() { transport.stop(); }
-        if ui.button("Beginning").clicked() { transport.seek(0); }
-        if ui.button("End").clicked() { transport.seek_to_end(); }
+        if ui.button("Play").clicked() { if transport.state() == TransportState::Stopped && transport.current_tick() == 0 { app.metronome.reset(); } else { app.metronome.sync_to_transport(transport); } transport.play(); }
+        if ui.button("Pause").clicked() { transport.pause(); app.metronome.sync_to_transport(transport); }
+        if ui.button("Stop").clicked() { transport.stop(); app.metronome.reset(); }
+        if ui.button("Beginning").clicked() { transport.seek(0); app.metronome.sync_to_transport(transport); }
+        if ui.button("End").clicked() { transport.seek_to_end(); app.metronome.sync_to_transport(transport); }
     });
     let mut requested_tick = transport.current_tick();
     if ui.add(egui::Slider::new(&mut requested_tick, 0..=transport.final_tick()).text("Seek tick")).changed() {
-        transport.seek(requested_tick.min(i64::MAX as u64) as i64);
+        transport.seek(requested_tick.min(i64::MAX as u64) as i64); app.metronome.sync_to_transport(transport);
     }
     let musical = transport.musical_position();
     egui::Grid::new("transport_position").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
@@ -64,6 +65,26 @@ fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
         ui.label("Current tick:"); ui.monospace(format!("{} / {}", transport.current_tick(), transport.final_tick())); ui.end_row();
     });
     if let Some(timeline) = &app.timeline { ui.weak(format!("Timeline model: {} expected events.", timeline.events.len())); }
+    ui.separator();
+}
+
+fn metronome_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
+    let Some(transport) = app.transport.as_ref() else { return; };
+    ui.add_space(10.0); ui.heading("METRONOME"); ui.separator();
+    ui.checkbox(&mut app.metronome_enabled, "Metronome on");
+    // `Metronome` has mutable state, so subdivision selection is applied via
+    // independent controls rather than replacing the generator.
+    ui.horizontal(|ui| {
+        let mut subdivision = app.metronome.subdivision();
+        ui.radio_value(&mut subdivision, Subdivision::Quarter, "Quarter notes");
+        ui.radio_value(&mut subdivision, Subdivision::Eighth, "Eighth notes");
+        ui.radio_value(&mut subdivision, Subdivision::Sixteenth, "Sixteenth notes");
+        if subdivision != app.metronome.subdivision() { app.metronome.set_subdivision(subdivision); app.metronome.sync_to_transport(transport); }
+        ui.weak(if app.click_audio.available() { "Synthesized click output available" } else { "Audio output unavailable" });
+    });
+    let tokens = count_tokens(transport.position_map(), transport.current_tick(), app.metronome.subdivision());
+    ui.horizontal_wrapped(|ui| { for token in tokens { if token.active { ui.colored_label(egui::Color32::from_rgb(120, 190, 255), egui::RichText::new(token.label).strong().size(22.0)); } else { ui.label(egui::RichText::new(token.label).size(20.0)); } } });
+    ui.weak(format!("Tempo: {:.1} BPM  •  {} subdivision", transport.current_bpm(), app.metronome.subdivision().label()));
     ui.separator();
 }
 

@@ -118,6 +118,10 @@ impl MusicalPositionMap {
         let within_measure = elapsed % ticks_per_measure;
         MusicalPosition { measure, beat: (within_measure / per_beat) as u32 + 1, ticks_into_beat: within_measure % per_beat, ticks_per_beat: per_beat }
     }
+
+    pub fn beats_per_measure_at_tick(&self, tick: u64) -> u8 {
+        self.signatures.iter().filter(|signature| signature.tick <= tick).last().map(|signature| signature.numerator).unwrap_or(4)
+    }
 }
 
 fn ticks_per_beat(ticks_per_quarter: u16, denominator_exponent: u8) -> u64 {

@@ -13,3 +13,4 @@ path = "src/main.rs"
 drums-core.workspace = true
 eframe.workspace = true
 rfd.workspace = true
+rodio.workspace = true

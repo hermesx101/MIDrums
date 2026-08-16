@@ -14,5 +14,5 @@ pub use mapping::{
     DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingStore,
     SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
 };
-pub use midi::{general_midi_component, ExpectedNote, MidiBackend, MidiError, MidiEvent, MidiFile, MidiFileError, MidiMessage, MidiParser, MidiTiming, MessageKind, MusicalPosition, MusicalPositionMap, MusicalTransport, PortInfo, TempoMap, Timeline, TimelineEvent, TransportState};
+pub use midi::{count_tokens, general_midi_component, ClickKind, CountToken, ExpectedNote, Metronome, MetronomeEvent, MidiBackend, MidiError, MidiEvent, MidiFile, MidiFileError, MidiMessage, MidiParser, MidiTiming, MessageKind, MusicalPosition, MusicalPositionMap, MusicalTransport, PortInfo, RhythmGrid, RhythmGridSlot, Subdivision, TempoMap, Timeline, TimelineEvent, TransportState};
 pub use time::{Clock, SharedClock, SystemClock};
