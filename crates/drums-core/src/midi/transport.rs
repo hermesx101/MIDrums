@@ -181,6 +181,8 @@ impl MusicalTransport {
     pub fn current_bpm(&self) -> f64 { self.original_bpm() * self.tempo_scale }
     pub fn practice_starting_bpm(&self) -> f64 { self.original_starting_bpm() * self.tempo_scale }
     pub fn tempo_scale(&self) -> f64 { self.tempo_scale }
+    pub fn effective_seconds_at_tick(&self, tick: u64) -> f64 { self.tempo_map.seconds_at_tick(tick as f64) / self.tempo_scale }
+    pub fn effective_tick_at_seconds(&self, seconds: f64) -> u64 { self.tempo_map.tick_at_seconds(seconds.max(0.0) * self.tempo_scale).round().clamp(0.0, self.final_tick as f64) as u64 }
     pub fn set_practice_bpm(&mut self, bpm: f64) { self.tempo_scale = bpm.clamp(20.0, 300.0) / self.original_starting_bpm(); }
     pub fn reset_practice_tempo(&mut self) { self.tempo_scale = 1.0; }
     pub fn musical_position(&self) -> MusicalPosition { self.position_map.position_at_tick(self.current_tick()) }

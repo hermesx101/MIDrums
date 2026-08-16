@@ -8,6 +8,7 @@
 
 pub mod mapping;
 pub mod midi;
+pub mod practice;
 pub mod time;
 
 pub use mapping::{
@@ -16,3 +17,4 @@ pub use mapping::{
 };
 pub use midi::{count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote, Metronome, MetronomeEvent, MidiBackend, MidiError, MidiEvent, MidiFile, MidiFileError, MidiMessage, MidiParser, MidiTiming, MessageKind, MusicalPosition, MusicalPositionMap, MusicalTransport, PortInfo, RhythmGrid, RhythmGridSlot, Subdivision, SubdivisionSuggestion, SuggestionConfidence, TempoMap, Timeline, TimelineEvent, TransportState};
 pub use time::{Clock, SharedClock, SystemClock};
+pub use practice::{ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget, TargetState};

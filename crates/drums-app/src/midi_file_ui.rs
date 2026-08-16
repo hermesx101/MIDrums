@@ -1,6 +1,6 @@
 //! Phase 3A MIDI-file inspection view. Parsing remains in `drums-core`.
 
-use drums_core::{count_tokens, MidiFile, MidiTiming, Subdivision, TransportState};
+use drums_core::{count_tokens, MidiFile, MidiTiming, PracticeResultKind, Subdivision, TargetState, TransportState};
 use eframe::egui;
 use crate::{DrumApp, View};
 
@@ -46,15 +46,15 @@ fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.heading("TRANSPORT");
     ui.horizontal(|ui| {
-        if ui.button("Play").clicked() { if transport.state() == TransportState::Stopped && transport.current_tick() == 0 { app.metronome.reset(); } else { app.metronome.sync_to_transport(transport); } transport.play(); }
+        if ui.button("Play").clicked() { if transport.state() == TransportState::Stopped && transport.current_tick() == 0 { app.metronome.reset(); if let Some(session) = app.practice_session.as_mut() { session.reset(); } } else { app.metronome.sync_to_transport(transport); } transport.play(); }
         if ui.button("Pause").clicked() { transport.pause(); app.metronome.sync_to_transport(transport); }
-        if ui.button("Stop").clicked() { transport.stop(); app.metronome.reset(); }
-        if ui.button("Beginning").clicked() { transport.seek(0); app.metronome.sync_to_transport(transport); }
-        if ui.button("End").clicked() { transport.seek_to_end(); app.metronome.sync_to_transport(transport); }
+        if ui.button("Stop").clicked() { transport.stop(); app.metronome.reset(); if let Some(session) = app.practice_session.as_mut() { session.on_stop(); } }
+        if ui.button("Beginning").clicked() { transport.seek(0); app.metronome.sync_to_transport(transport); if let Some(session) = app.practice_session.as_mut() { session.on_seek_to_tick(transport.current_tick(), transport); } }
+        if ui.button("End").clicked() { transport.seek_to_end(); app.metronome.sync_to_transport(transport); if let Some(session) = app.practice_session.as_mut() { session.on_seek_to_tick(transport.current_tick(), transport); } }
     });
     let mut requested_tick = transport.current_tick();
     if ui.add(egui::Slider::new(&mut requested_tick, 0..=transport.final_tick()).text("Seek tick")).changed() {
-        transport.seek(requested_tick.min(i64::MAX as u64) as i64); app.metronome.sync_to_transport(transport);
+        transport.seek(requested_tick.min(i64::MAX as u64) as i64); app.metronome.sync_to_transport(transport); if let Some(session) = app.practice_session.as_mut() { session.on_seek_to_tick(transport.current_tick(), transport); }
     }
     let musical = transport.musical_position();
     let (numerator, denominator) = transport.position_map().time_signature_at_tick(transport.current_tick());
@@ -81,6 +81,42 @@ fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
     });
     if transport.tempo_scale() != 1.0 { ui.weak(format!("Current effective tempo: {:.1} BPM (original current tempo: {:.1} BPM)", transport.current_bpm(), transport.original_bpm())); }
     if let Some(timeline) = &app.timeline { ui.weak(format!("Timeline model: {} expected events.", timeline.events.len())); }
+    if let Some(session) = &app.practice_session {
+        ui.add_space(6.0);
+        ui.label(format!("Practice engine: {} pending • {} results • ±{} ms window", session.pending_count(), session.results().len(), session.matching_window().as_millis()));
+        ui.monospace(format!("Current transport: tick {} • {}", transport.current_tick(), time_text(transport.elapsed_seconds())));
+        ui.add_space(6.0);
+        ui.strong("CURRENT TARGET");
+        if let Some(target) = session.current_target(transport.current_tick(), transport) {
+            let components = target.notes.iter().filter_map(|note| note.drum_component).map(|component| component.label()).collect::<Vec<_>>().join(" + ");
+            let first_index = target.expected_indices[0];
+            let last_index = *target.expected_indices.last().unwrap();
+            ui.label(egui::RichText::new(components).strong().size(24.0));
+            ui.monospace(if first_index == last_index { format!("Target #{} / {}", first_index + 1, session.expected().len()) } else { format!("Targets #{}-{} / {}", first_index + 1, last_index + 1, session.expected().len()) });
+            ui.label(egui::RichText::new(if target.state == TargetState::Hittable { "NOW".to_string() } else { format!("In: {:.2} seconds", target.time_until_seconds.max(0.0)) }).strong().size(20.0));
+            let approach = (1.0 - target.time_until_seconds.max(0.0) as f32 / 5.0).clamp(0.0, 1.0);
+            ui.add(egui::ProgressBar::new(approach).desired_width(260.0).show_percentage());
+            ui.monospace(format!("Tick {} • {} • {:+.1} ms", target.tick, precise_time_text(transport.effective_seconds_at_tick(target.tick)), target.time_until_seconds * 1_000.0));
+            ui.strong("NEXT TARGET");
+            if let Some((next_index, next)) = session.next_known_after(last_index) {
+                ui.monospace(format!("#{} {} • MIDI {} • tick {} • {}", next_index, next.drum_component.unwrap().label(), next.midi_note, next.tick, precise_time_text(transport.effective_seconds_at_tick(next.tick))));
+            } else { ui.monospace("None"); }
+        } else { ui.monospace("No remaining matchable expected event"); }
+        ui.add_space(6.0);
+        ui.strong("LAST RESULT");
+        if let Some(result) = session.results().last() {
+            let expected = result.expected.as_ref().and_then(|note| note.drum_component).map(|value| value.label()).unwrap_or("—");
+            let actual = result.actual.as_ref().and_then(|hit| hit.drum_component).map(|value| value.label()).unwrap_or("—");
+            let timing = result.timing_difference_micros.map(|value| format!("{:+.1} ms", value as f64 / 1_000.0)).unwrap_or_else(|| "—".to_string());
+            let result_label = match result.kind { PracticeResultKind::CorrectHit => "HIT", PracticeResultKind::WrongDrum => "WRONG DRUM", PracticeResultKind::Missed => "MISSED", PracticeResultKind::Ignored => "IGNORED" };
+            ui.monospace(format!("{result_label}   Expected: {expected}   Actual: {actual}   Difference: {timing}"));
+        } else { ui.monospace("No result yet"); }
+        egui::CollapsingHeader::new("First expected events").show(ui, |ui| {
+            for (index, note) in session.expected().iter().take(8).enumerate() {
+                ui.monospace(format!("#{index}: {} • MIDI {} • tick {} • {:.3}s • track {} • channel {}", note.drum_component.map(|value| value.label()).unwrap_or("Unknown"), note.midi_note, note.tick, transport.effective_seconds_at_tick(note.tick), note.track + 1, note.channel + 1));
+            }
+        });
+    }
     ui.separator();
 }
 
@@ -127,4 +163,5 @@ fn metadata(ui: &mut egui::Ui, file: &MidiFile) {
 fn timing_text(timing: MidiTiming) -> String { match timing { MidiTiming::TicksPerQuarter(ticks) => format!("{ticks} ticks per quarter note"), MidiTiming::Timecode { frames_per_second, ticks_per_frame } => format!("SMPTE: {frames_per_second} fps, {ticks_per_frame} ticks/frame") } }
 fn duration_text(seconds: f64) -> String { format!("{:02}:{:02}", (seconds / 60.0).floor() as u64, (seconds as u64) % 60) }
 fn time_text(seconds: f64) -> String { format!("{:02}:{:05.2}", (seconds / 60.0).floor() as u64, seconds % 60.0) }
+fn precise_time_text(seconds: f64) -> String { format!("{:02}:{:06.3}", (seconds / 60.0).floor() as u64, seconds % 60.0) }
 fn channels(channels: &[u8]) -> String { if channels.is_empty() { "none".to_string() } else { channels.iter().map(|channel| (channel + 1).to_string()).collect::<Vec<_>>().join(", ") } }

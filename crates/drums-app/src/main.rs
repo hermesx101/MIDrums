@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{suggest_subdivision, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Subdivision, SubdivisionSuggestion, Timeline};
+use drums_core::{suggest_subdivision, ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, PracticeSession, Subdivision, SubdivisionSuggestion, Timeline};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -55,6 +55,7 @@ fn main() -> eframe::Result {
 
 /// Application state. GUI-only; no MIDI processing happens here.
 struct DrumApp {
+    clock: SharedClock,
     backend: MidiBackend,
     ports: Vec<PortInfo>,
     selected: Option<usize>,
@@ -80,6 +81,7 @@ struct DrumApp {
     midi_import_error: Option<String>,
     transport: Option<MusicalTransport>,
     timeline: Option<Timeline>,
+    practice_session: Option<PracticeSession>,
     last_transport_update: Instant,
     metronome: Metronome,
     subdivision_auto: bool,
@@ -91,7 +93,7 @@ struct DrumApp {
 impl DrumApp {
     fn new(ctx: &eframe::CreationContext<'_>) -> Self {
         let clock: SharedClock = Arc::new(SystemClock::new());
-        let mut backend = MidiBackend::new(clock);
+        let mut backend = MidiBackend::new(clock.clone());
 
         // As soon as the MIDI thread queues events, wake eframe so the UI
         // repaints immediately instead of waiting for mouse/keyboard input.
@@ -111,6 +113,7 @@ impl DrumApp {
         set_app_style(&ctx.egui_ctx);
 
         Self {
+            clock,
             backend,
             ports,
             selected: None,
@@ -129,6 +132,7 @@ impl DrumApp {
             midi_import_error: None,
             transport: None,
             timeline: None,
+            practice_session: None,
             last_transport_update: Instant::now(),
             metronome: Metronome::new(Subdivision::Eighth),
             subdivision_auto: true,
@@ -140,6 +144,7 @@ impl DrumApp {
 
     fn drain_events(&mut self) {
         let new_events = self.backend.poll_events();
+        let observed_at_micros = self.clock.now_micros();
         // While a setup run is active, every incoming MIDI event is also pushed
         // into the wizard so it can spot the note the user hits. The wizard
         // handles Note On/Off filtering and confirmation itself.
@@ -151,6 +156,11 @@ impl DrumApp {
             }
         }
         for ev in new_events {
+            if let (Some(session), Some(config), Some(transport)) = (&mut self.practice_session, &self.active_config, &self.transport) {
+                if transport.is_playing() {
+                    if let Some(hit) = ActualHit::from_midi_event_observed_at(&ev, config, transport, observed_at_micros) { session.record_hit(hit, transport); }
+                }
+            }
             self.events.insert(0, ev);
         }
         if self.events.len() > 400 {
@@ -228,12 +238,14 @@ impl DrumApp {
     fn rebuild_timeline(&mut self) {
         let (Some(file), Some(track), Some(transport)) = (&self.imported_midi, self.selected_drum_track, &self.transport) else {
             self.timeline = None;
+            self.practice_session = None;
             return;
         };
         let notes = file.expected_notes_for_track(track, self.active_config.as_ref());
         let suggestion = suggest_subdivision(file.timing, &notes);
         self.subdivision_suggestion = Some(suggestion);
         if self.subdivision_auto { self.metronome.set_subdivision(suggestion.subdivision); self.metronome.sync_to_transport(transport); }
+        self.practice_session = Some(PracticeSession::new(notes.clone(), MatchingConfig::default()));
         self.timeline = Some(Timeline::from_expected_notes(notes, transport.position_map(), file.duration_ticks));
     }
 }
@@ -257,13 +269,14 @@ impl eframe::App for DrumApp {
             }
         }
 
-        self.drain_events();
-
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_transport_update);
         self.last_transport_update = now;
+        let mut reached_song_end = false;
         if let Some(transport) = self.transport.as_mut() {
+            let was_playing = transport.is_playing();
             transport.advance_by(elapsed);
+            reached_song_end = was_playing && !transport.is_playing() && transport.current_tick() == transport.final_tick();
             if self.metronome_enabled {
                 for event in self.metronome.observe(transport) { self.click_audio.play(event.kind); }
             } else {
@@ -274,6 +287,14 @@ impl eframe::App for DrumApp {
                 // frame so the elapsed monotonic-time transport can be shown.
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
+        }
+
+        // Sample live hits only after bringing the single musical transport up
+        // to date for this frame, avoiding a one-frame-old transport tick.
+        self.drain_events();
+        if let (Some(session), Some(transport)) = (&mut self.practice_session, &self.transport) {
+            session.advance_to_tick(transport.current_tick(), transport);
+            if reached_song_end { session.finish(); }
         }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
