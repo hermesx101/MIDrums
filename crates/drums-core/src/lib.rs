@@ -8,13 +8,26 @@
 
 pub mod mapping;
 pub mod midi;
+pub mod performance;
 pub mod practice;
 pub mod time;
 
 pub use mapping::{
-    DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingStore,
-    SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
+    DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingStore, SetupWizard,
+    SetupWizardState, SUPPORTED_COMPONENTS,
 };
-pub use midi::{count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote, Metronome, MetronomeEvent, MidiBackend, MidiError, MidiEvent, MidiFile, MidiFileError, MidiMessage, MidiParser, MidiTiming, MessageKind, MusicalPosition, MusicalPositionMap, MusicalTransport, PortInfo, RhythmGrid, RhythmGridSlot, Subdivision, SubdivisionSuggestion, SuggestionConfidence, TempoMap, Timeline, TimelineEvent, TransportState};
+pub use midi::{
+    count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote,
+    MessageKind, Metronome, MetronomeEvent, MidiBackend, MidiError, MidiEvent, MidiFile,
+    MidiFileError, MidiMessage, MidiParser, MidiTiming, MusicalPosition, MusicalPositionMap,
+    MusicalTransport, PortInfo, RhythmGrid, RhythmGridSlot, Subdivision, SubdivisionSuggestion,
+    SuggestionConfidence, TempoMap, Timeline, TimelineEvent, TransportState,
+};
+pub use performance::{
+    ComponentPerformance, PerformanceConfig, PracticePerformance, TimingTendency,
+};
+pub use practice::{
+    ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget,
+    TargetState, TimingConfig, TimingJudgment,
+};
 pub use time::{Clock, SharedClock, SystemClock};
-pub use practice::{ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget, TargetState};

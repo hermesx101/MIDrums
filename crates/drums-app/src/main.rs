@@ -15,9 +15,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod click_audio;
 mod mapping_ui;
 mod midi_file_ui;
-mod click_audio;
 mod wizard_ui;
 
 use std::sync::Arc;
@@ -25,7 +25,11 @@ use std::time::Instant;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{suggest_subdivision, ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, PracticeSession, Subdivision, SubdivisionSuggestion, Timeline};
+use drums_core::{
+    suggest_subdivision, ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile,
+    MusicalTransport, PortInfo, PracticeResult, PracticeSession, Subdivision,
+    SubdivisionSuggestion, Timeline,
+};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -82,6 +86,10 @@ struct DrumApp {
     transport: Option<MusicalTransport>,
     timeline: Option<Timeline>,
     practice_session: Option<PracticeSession>,
+    last_live_hit: Option<ActualHit>,
+    displayed_practice_result: Option<PracticeResult>,
+    displayed_result_since: Option<Instant>,
+    observed_practice_result_count: usize,
     last_transport_update: Instant,
     metronome: Metronome,
     subdivision_auto: bool,
@@ -133,6 +141,10 @@ impl DrumApp {
             transport: None,
             timeline: None,
             practice_session: None,
+            last_live_hit: None,
+            displayed_practice_result: None,
+            displayed_result_since: None,
+            observed_practice_result_count: 0,
             last_transport_update: Instant::now(),
             metronome: Metronome::new(Subdivision::Eighth),
             subdivision_auto: true,
@@ -156,9 +168,19 @@ impl DrumApp {
             }
         }
         for ev in new_events {
-            if let (Some(session), Some(config), Some(transport)) = (&mut self.practice_session, &self.active_config, &self.transport) {
-                if transport.is_playing() {
-                    if let Some(hit) = ActualHit::from_midi_event_observed_at(&ev, config, transport, observed_at_micros) { session.record_hit(hit, transport); }
+            if let (Some(config), Some(transport)) = (&self.active_config, &self.transport) {
+                if let Some(hit) = ActualHit::from_midi_event_observed_at(
+                    &ev,
+                    config,
+                    transport,
+                    observed_at_micros,
+                ) {
+                    self.last_live_hit = Some(hit.clone());
+                    if transport.is_playing() {
+                        if let Some(session) = self.practice_session.as_mut() {
+                            session.record_hit(hit, transport);
+                        }
+                    }
                 }
             }
             self.events.insert(0, ev);
@@ -215,11 +237,18 @@ impl DrumApp {
         self.wizard = None;
         self.wizard_device = None;
         self.mapping_draft = None;
+        self.last_live_hit = None;
         self.status = "Disconnected.".to_string();
     }
 
     fn import_midi_clicked(&mut self) {
-        let Some(path) = rfd::FileDialog::new().add_filter("MIDI files", &["mid", "midi"]).set_title("Import MIDI file").pick_file() else { return; };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI files", &["mid", "midi"])
+            .set_title("Import MIDI file")
+            .pick_file()
+        else {
+            return;
+        };
         match MidiFile::from_path(&path) {
             Ok(file) => {
                 self.selected_drum_track = file.suggested_drum_track();
@@ -231,22 +260,45 @@ impl DrumApp {
                 self.last_transport_update = Instant::now();
                 self.view = View::MidiInspection;
             }
-            Err(error) => { self.midi_import_error = Some(error.to_string()); self.view = View::MidiInspection; }
+            Err(error) => {
+                self.midi_import_error = Some(error.to_string());
+                self.view = View::MidiInspection;
+            }
         }
     }
 
     fn rebuild_timeline(&mut self) {
-        let (Some(file), Some(track), Some(transport)) = (&self.imported_midi, self.selected_drum_track, &self.transport) else {
+        let (Some(file), Some(track), Some(transport)) = (
+            &self.imported_midi,
+            self.selected_drum_track,
+            &self.transport,
+        ) else {
             self.timeline = None;
             self.practice_session = None;
+            self.displayed_practice_result = None;
+            self.displayed_result_since = None;
+            self.observed_practice_result_count = 0;
             return;
         };
         let notes = file.expected_notes_for_track(track, self.active_config.as_ref());
         let suggestion = suggest_subdivision(file.timing, &notes);
         self.subdivision_suggestion = Some(suggestion);
-        if self.subdivision_auto { self.metronome.set_subdivision(suggestion.subdivision); self.metronome.sync_to_transport(transport); }
-        self.practice_session = Some(PracticeSession::new(notes.clone(), MatchingConfig::default()));
-        self.timeline = Some(Timeline::from_expected_notes(notes, transport.position_map(), file.duration_ticks));
+        if self.subdivision_auto {
+            self.metronome.set_subdivision(suggestion.subdivision);
+            self.metronome.sync_to_transport(transport);
+        }
+        self.practice_session = Some(PracticeSession::new(
+            notes.clone(),
+            MatchingConfig::default(),
+        ));
+        self.displayed_practice_result = None;
+        self.displayed_result_since = None;
+        self.observed_practice_result_count = 0;
+        self.timeline = Some(Timeline::from_expected_notes(
+            notes,
+            transport.position_map(),
+            file.duration_ticks,
+        ));
     }
 }
 impl eframe::App for DrumApp {
@@ -276,9 +328,13 @@ impl eframe::App for DrumApp {
         if let Some(transport) = self.transport.as_mut() {
             let was_playing = transport.is_playing();
             transport.advance_by(elapsed);
-            reached_song_end = was_playing && !transport.is_playing() && transport.current_tick() == transport.final_tick();
+            reached_song_end = was_playing
+                && !transport.is_playing()
+                && transport.current_tick() == transport.final_tick();
             if self.metronome_enabled {
-                for event in self.metronome.observe(transport) { self.click_audio.play(event.kind); }
+                for event in self.metronome.observe(transport) {
+                    self.click_audio.play(event.kind);
+                }
             } else {
                 self.metronome.sync_to_transport(transport);
             }
@@ -294,7 +350,26 @@ impl eframe::App for DrumApp {
         self.drain_events();
         if let (Some(session), Some(transport)) = (&mut self.practice_session, &self.transport) {
             session.advance_to_tick(transport.current_tick(), transport);
-            if reached_song_end { session.finish(); }
+            if reached_song_end {
+                session.finish();
+            }
+        }
+        if let Some(session) = &self.practice_session {
+            let result_count = session.results().len();
+            if result_count < self.observed_practice_result_count {
+                self.displayed_practice_result = None;
+                self.displayed_result_since = None;
+            } else if result_count > self.observed_practice_result_count {
+                self.displayed_practice_result = session.results().last().cloned();
+                self.displayed_result_since = Some(now);
+            }
+            self.observed_practice_result_count = result_count;
+            if self.displayed_result_since.is_some_and(|since| {
+                now.duration_since(since) >= std::time::Duration::from_millis(1_200)
+            }) {
+                self.displayed_practice_result = None;
+                self.displayed_result_since = None;
+            }
         }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -387,12 +462,16 @@ impl eframe::App for DrumApp {
                     View::Monitor => show_monitor_ui(self, ui),
                     View::Setup => wizard_ui::show(self, ui),
                     View::MidiInspection => midi_file_ui::show(self, ui),
-                                                        });
+                });
         });
 
         // This second check covers a Play click made during the UI pass above.
         // The transport itself remains driven solely by elapsed monotonic time.
-        if self.transport.as_ref().is_some_and(|transport| transport.is_playing()) {
+        if self
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.is_playing())
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
