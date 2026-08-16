@@ -12,4 +12,6 @@ description = "Open-source MIDI drum practice application."
 [workspace.dependencies]
 midir = "0.10"
 eframe = "0.31"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 drums-core = { path = "crates/drums-core" }

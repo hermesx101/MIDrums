@@ -1,4 +1,4 @@
-//! DRUMS desktop GUI (Phase 1).
+//! DRUMS desktop GUI (Phase 1 + Phase 2).
 //!
 //! This crate is deliberately tiny: it owns the egui/eframe front-end and
 //! delegates all MIDI work to `drums-core`. The MIDI backend runs its own
@@ -6,21 +6,40 @@
 //! thread-safe event channel each frame and displays the results. The GUI
 //! frame rate is never a timing source — every event carries the
 //! high-resolution timestamp captured at the moment it was received.
+//!
+//! Phase 2 adds two focused flows on top of the Phase 1 monitor:
+//! - the **setup wizard** (`wizard_ui`), which learns each drum's MIDI note by
+//!   waiting for, and asking the user to confirm, real MIDI hits, and
+//! - the **manual mapping** view (`mapping_ui`) for inspecting/editing a
+//!   device's saved configuration.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod mapping_ui;
+mod wizard_ui;
+
 use std::sync::Arc;
 
+use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
 use drums_core::{MidiBackend, MidiEvent, PortInfo};
 use eframe::egui;
 
+/// Top-level views the app can show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    /// Phase 1 live MIDI monitor.
+    Monitor,
+    /// Phase 2 setup wizard.
+    Setup,
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 620.0])
+            .with_inner_size([900.0, 640.0])
             .with_min_inner_size([640.0, 420.0])
-            .with_title("MIDI Drum Practice — Phase 1"),
+            .with_title("MIDI Drum Practice — Phase 2"),
         ..Default::default()
     };
     eframe::run_native(
@@ -40,6 +59,18 @@ struct DrumApp {
     /// Received MIDI events, newest first.
     events: Vec<MidiEvent>,
     frames: u64,
+    /// Per-device mapping persistence.
+    store: MappingStore,
+    /// The configuration currently active for the connected device.
+    active_config: Option<DrumKitConfiguration>,
+    /// Setup wizard state, present while a setup run is in progress.
+    wizard: Option<SetupWizard>,
+    /// Name of the device the running wizard was started against.
+    wizard_device: Option<String>,
+    /// Working copy edited in the manual mapping view.
+    mapping_draft: Option<DrumKitConfiguration>,
+    /// Currently selected view/tab.
+    view: View,
 }
 
 impl DrumApp {
@@ -72,11 +103,27 @@ impl DrumApp {
             connected: false,
             events: Vec::new(),
             frames: 0,
+            store: MappingStore::default(),
+            active_config: None,
+            wizard: None,
+            wizard_device: None,
+            mapping_draft: None,
+            view: View::Monitor,
         }
     }
 
     fn drain_events(&mut self) {
         let new_events = self.backend.poll_events();
+        // While a setup run is active, every incoming MIDI event is also pushed
+        // into the wizard so it can spot the note the user hits. The wizard
+        // handles Note On/Off filtering and confirmation itself.
+        if self.wizard.is_some() {
+            for ev in &new_events {
+                if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.handle_event(ev);
+                }
+            }
+        }
         for ev in new_events {
             self.events.insert(0, ev);
         }
@@ -101,7 +148,21 @@ impl DrumApp {
             Ok(name) => {
                 self.connected = true;
                 self.events.clear();
-                self.status = format!("Connected to “{name}”.");
+                // Restore a previously saved mapping for this device, so the
+                // same kit reconnects to the configuration the user built.
+                let stored = self.store.load(&name).unwrap_or(None);
+                self.active_config = stored.clone();
+                self.mapping_draft = None;
+                self.status = match &stored {
+                    Some(cfg) => format!(
+                        "Connected to “{name}”. Restored mapping: {} of {} drums configured.",
+                        cfg.mapped_count(),
+                        SUPPORTED_COMPONENTS.len()
+                    ),
+                    None => format!(
+                        "Connected to “{name}”. No saved mapping yet — run the Setup Wizard."
+                    ),
+                };
             }
             Err(e) => {
                 self.connected = false;
@@ -114,6 +175,10 @@ impl DrumApp {
         self.backend.disconnect();
         self.connected = false;
         self.events.clear();
+        self.active_config = None;
+        self.wizard = None;
+        self.wizard_device = None;
+        self.mapping_draft = None;
         self.status = "Disconnected.".to_string();
     }
 }
@@ -128,6 +193,10 @@ impl eframe::App for DrumApp {
             if was_connected && !alive {
                 self.connected = false;
                 self.events.clear();
+                self.active_config = None;
+                self.wizard = None;
+                self.wizard_device = None;
+                self.mapping_draft = None;
                 self.status =
                     "Device disconnected — re-connect or check the cable/port.".to_string();
             }
@@ -138,7 +207,7 @@ impl eframe::App for DrumApp {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.heading("MIDI Drum Practice");
-            ui.label("Phase 1 — MIDI Foundation (device monitoring)");
+            ui.label("Phase 2 — Setup wizard & drum mapping");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("⟳ Refresh devices").clicked() {
@@ -176,6 +245,24 @@ impl eframe::App for DrumApp {
                     }
                 }
             });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::Monitor, "📡 Monitor");
+                ui.selectable_value(&mut self.view, View::Setup, "🎛 Setup Wizard");
+            });
+            ui.add_space(4.0);
+            if self.connected {
+                let mapping_line = match &self.active_config {
+                    Some(cfg) => format!(
+                        "Drum mapping for “{}”: {}/{} components configured.",
+                        cfg.device_name,
+                        cfg.mapped_count(),
+                        SUPPORTED_COMPONENTS.len()
+                    ),
+                    None => "No drum mapping loaded for this device yet.".to_string(),
+                };
+                ui.weak(mapping_line);
+            }
             ui.add_space(2.0);
             ui.label(format!(
                 "Available MIDI input devices: {}   ·   {}",
@@ -198,48 +285,60 @@ impl eframe::App for DrumApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Latest event");
-            ui.separator();
-
-            if let Some(latest) = self.events.first() {
-                egui::Grid::new("latest_grid")
-                    .num_columns(2)
-                    .spacing([24.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("Message type");
-                        ui.monospace(latest.message.kind.name());
-                        ui.end_row();
-                        ui.label("MIDI note number");
-                        ui.monospace(fmt_opt(latest.message.note()));
-                        ui.end_row();
-                        ui.label("Velocity");
-                        ui.monospace(fmt_opt(latest.message.velocity()));
-                        ui.end_row();
-                        ui.label("MIDI channel");
-                        ui.monospace(fmt_opt(latest.message.channel_number()));
-                        ui.end_row();
-                        ui.label("Timestamp");
-                        ui.monospace(timestamp_text(latest.timestamp_micros));
-                        ui.end_row();
-                    });
-            } else {
-                ui.weak("No MIDI events yet. Connect a device and hit a pad.");
-            }
-
-            ui.add_space(12.0);
-            ui.heading(format!("Event log ({})", self.events.len()));
-            ui.separator();
+            // A vertically scrollable content area is shared by all views so
+            // the wizard/mapping tables never get clipped on small windows.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for ev in &self.events {
-                        ui.monospace(fmt_event(ev));
-                    }
-                });
+                .show(ui, |ui| match self.view {
+                    View::Monitor => show_monitor_ui(self, ui),
+                    View::Setup => wizard_ui::show(self, ui),
+                                                        });
         });
     }
+}
+
+/// Phase 1 live MIDI monitor view (unchanged behaviour, moved into the tab).
+fn show_monitor_ui(app: &mut DrumApp, ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    ui.heading("Latest event");
+    ui.separator();
+
+    if let Some(latest) = app.events.first() {
+        egui::Grid::new("latest_grid")
+            .num_columns(2)
+            .spacing([24.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Message type");
+                ui.monospace(latest.message.kind.name());
+                ui.end_row();
+                ui.label("MIDI note number");
+                ui.monospace(fmt_opt(latest.message.note()));
+                ui.end_row();
+                ui.label("Velocity");
+                ui.monospace(fmt_opt(latest.message.velocity()));
+                ui.end_row();
+                ui.label("MIDI channel");
+                ui.monospace(fmt_opt(latest.message.channel_number()));
+                ui.end_row();
+                ui.label("Timestamp");
+                ui.monospace(timestamp_text(latest.timestamp_micros));
+                ui.end_row();
+            });
+    } else {
+        ui.weak("No MIDI events yet. Connect a device and hit a pad.");
+    }
+
+    ui.add_space(12.0);
+    ui.heading(format!("Event log ({})", app.events.len()));
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for ev in &app.events {
+                ui.monospace(fmt_event(ev));
+            }
+        });
 }
 
 /// Applies a dark theme for a serious, low-distraction look.

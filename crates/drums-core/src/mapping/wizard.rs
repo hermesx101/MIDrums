@@ -1,0 +1,626 @@
+//! Setup wizard state machine.
+//!
+//! This is *pure logic*: it knows nothing about the GUI frame loop, the MIDI
+//! callback or the event channel. The GUI feeds timestamped `MidiEvent`s into
+//! [`SetupWizard::handle_event`] and calls the navigation methods (`accept`,
+//! `retry`, `skip`, `back`, `cancel`, `start`, `finish`). Because every input
+//! is an explicit call, the whole state machine is unit-testable without any
+//! hardware or rendering.
+//!
+//! ## Hit detection rules
+//!
+//! - Only **Note On with velocity > 0** is treated as a drum hit.
+//! - Note On with velocity 0 follows the MIDI convention and is treated as a
+//!   Note Off — it never becomes a hit.
+//! - Note Off messages are ignored for hit detection.
+//! - Timestamps come straight from the MIDI event (captured inside the
+//!   real-time callback by `drums-core`); GUI timing is never introduced here.
+//! - Only the **first** hit is captured while waiting for a component. Any
+//!   additional Note On events arriving "close together" (within
+//!   [`CONFLICT_WINDOW_MICROS`]) after it are recorded as *conflicting* hits so
+//!   the user can see that multiple notes arrived — but a drum never receives
+//!   several notes from one prompt. Nothing is accepted automatically.
+//! - After a hit is accepted or retried, further hits within
+//!   [`HIT_DEBOUNCE_MICROS`] are ignored, so a double-trigger or a flam from
+//!   the previous pad cannot slide into the *next* component's prompt.
+
+use super::{DrumComponent, DrumKitConfiguration, DrumMapping, SUPPORTED_COMPONENTS};
+use crate::midi::{MidiEvent, MessageKind};
+
+/// After a hit is accepted/retried, Note On events arriving within this window
+/// (relative to the original hit timestamp) are suppressed so they are not
+/// mistaken for the next component's hit.
+pub const HIT_DEBOUNCE_MICROS: u64 = 50 * 1000; // 50 ms
+
+/// Window after the first captured hit during which additional Note On events
+/// are collected as "conflicting" hits (shown to the user for confirmation).
+pub const CONFLICT_WINDOW_MICROS: u64 = 250 * 1000; // 250 ms
+
+/// A drum hit detected from a MIDI event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DetectedHit {
+    /// MIDI note number.
+    pub midi_note: u8,
+    /// MIDI channel as displayed, 1..=16.
+    pub channel: u8,
+    /// Note-on velocity.
+    pub velocity: u8,
+    /// Original MIDI event timestamp in microseconds (no GUI timing).
+    pub timestamp_micros: u64,
+}
+
+impl DetectedHit {
+    /// Converts a MIDI event into a drum hit according to the rules in the
+    /// module docs, or `None` when the event is not a positive-velocity Note On.
+    pub fn from_event(ev: &MidiEvent) -> Option<Self> {
+        let msg = &ev.message;
+        if msg.kind != MessageKind::NoteOn {
+            return None;
+        }
+        let midi_note = msg.data1?;
+        let velocity = msg.data2.unwrap_or(0);
+        if velocity == 0 {
+            // Note On with zero velocity == Note Off (MIDI convention).
+            return None;
+        }
+        let channel = msg.channel_number().unwrap_or(1);
+        Some(Self {
+            midi_note,
+            channel,
+            velocity,
+            timestamp_micros: ev.timestamp_micros,
+        })
+    }
+}
+/// The current state of the setup wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupWizardState {
+    /// Shown before the user presses "Start setup".
+    Intro,
+    /// Waiting for the user to hit the given component.
+    Detecting(DrumComponent),
+    /// A hit has been captured; the user must accept or retry it.
+    Confirming(DrumComponent),
+    /// Every component was handled (accepted or skipped).
+    Completed,
+    /// The user cancelled; all collected results were discarded.
+    Canceled,
+}
+
+/// Interactive setup-wizard state machine for mapping a drum kit.
+#[derive(Clone, Debug)]
+pub struct SetupWizard {
+    state: SetupWizardState,
+    /// Index of the current component in [`SUPPORTED_COMPONENTS`] while the
+    /// wizard is running.
+    index: usize,
+    /// The hit awaiting confirmation, if any.
+    detected: Option<DetectedHit>,
+    /// Additional hits captured near the detected one (possible mistake).
+    conflicting: Vec<DetectedHit>,
+    /// Accepted mappings, indexed by component order. `None` = skipped/unset.
+    accepted: [Option<DrumMapping>; SUPPORTED_COMPONENTS.len()],
+    /// Whether each component has been handled (accepted *or* skipped).
+    handled: [bool; SUPPORTED_COMPONENTS.len()],
+    /// Ignore hits with timestamp <= this value (micros).
+    suppress_until_micros: u64,
+    /// Guard against calling [`Self::finish`] twice.
+    finished: bool,
+}
+
+impl Default for SetupWizard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SetupWizard {
+    /// Creates a fresh wizard in the `Intro` state with nothing captured.
+    pub fn new() -> Self {
+        Self {
+            state: SetupWizardState::Intro,
+            index: 0,
+            detected: None,
+            conflicting: Vec::new(),
+            accepted: std::array::from_fn(|_| None),
+            handled: [false; SUPPORTED_COMPONENTS.len()],
+            suppress_until_micros: 0,
+            finished: false,
+        }
+    }
+
+    /// Starts (or restarts) the wizard from the first component.
+    pub fn start(&mut self) {
+        self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[0]);
+        self.index = 0;
+        self.detected = None;
+        self.conflicting.clear();
+        self.accepted = std::array::from_fn(|_| None);
+        self.handled = [false; SUPPORTED_COMPONENTS.len()];
+        self.suppress_until_micros = 0;
+        self.finished = false;
+    }
+
+    /// Cancels the run and discards everything collected so far.
+    pub fn cancel(&mut self) {
+        self.state = SetupWizardState::Canceled;
+        self.detected = None;
+        self.conflicting.clear();
+        self.accepted = std::array::from_fn(|_| None);
+        self.handled = [false; SUPPORTED_COMPONENTS.len()];
+        self.suppress_until_micros = 0;
+    }
+
+    pub fn state(&self) -> SetupWizardState {
+        self.state
+    }
+
+    /// The component the wizard is currently handling, if active.
+    pub fn current_component(&self) -> Option<DrumComponent> {
+        match self.state {
+            SetupWizardState::Detecting(c)
+            | SetupWizardState::Confirming(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The hit currently awaiting confirmation (if any).
+    pub fn detected_hit(&self) -> Option<DetectedHit> {
+        self.detected
+    }
+
+    /// Additional hits that arrived close to the detected one.
+    pub fn conflicting_hits(&self) -> &[DetectedHit] {
+        &self.conflicting
+    }
+
+    /// Whether the given component has an accepted mapping so far.
+    pub fn is_done(&self, component: DrumComponent) -> bool {
+        SUPPORTED_COMPONENTS
+            .iter()
+            .position(|&c| c == component)
+            .map(|i| self.accepted[i].is_some())
+            .unwrap_or(false)
+    }
+
+    /// Whether a component has already been handled (accepted or skipped).
+    pub fn is_handled(&self, component: DrumComponent) -> bool {
+        SUPPORTED_COMPONENTS
+            .iter()
+            .position(|&c| c == component)
+            .map(|i| self.handled[i])
+            .unwrap_or(false)
+    }
+
+    /// Number of components accepted so far.
+    pub fn done_count(&self) -> usize {
+        self.accepted.iter().filter(|m| m.is_some()).count()
+    }
+
+    /// Whether the user can go back to a previous component.
+    pub fn can_go_back(&self) -> bool {
+        self.index > 0
+            && matches!(
+                self.state,
+                SetupWizardState::Detecting(_) | SetupWizardState::Confirming(_)
+            )
+    }
+
+    /// Feeds a MIDI event into the wizard. Returns `true` if a new hit was
+    /// captured (the GUI may want to repaint immediately).
+    pub fn handle_event(&mut self, ev: &MidiEvent) -> bool {
+        let Some(hit) = DetectedHit::from_event(ev) else {
+            return false;
+        };
+        if hit.timestamp_micros <= self.suppress_until_micros {
+            return false;
+        }
+        match self.state {
+            SetupWizardState::Detecting(_) => {
+                self.detected = Some(hit);
+                self.conflicting.clear();
+                self.state =
+                    SetupWizardState::Confirming(self.current_component().unwrap());
+                true
+            }
+            SetupWizardState::Confirming(_) => {
+                if let Some(base) = self.detected {
+                    let close = hit.timestamp_micros
+                        .saturating_sub(base.timestamp_micros)
+                        <= CONFLICT_WINDOW_MICROS;
+                    if close
+                        && hit.midi_note != base.midi_note
+                        && !self.conflicting.iter().any(|c| {
+                            c.midi_note == hit.midi_note && c.channel == hit.channel
+                        })
+                    {
+                        self.conflicting.push(hit);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Accepts the detected note and advances to the next component.
+    pub fn accept(&mut self) {
+        if !matches!(self.state, SetupWizardState::Confirming(_)) {
+            return;
+        }
+        let Some(hit) = self.detected else {
+            return;
+        };
+        let component = self.current_component().unwrap();
+        self.accepted[self.index] = Some(DrumMapping {
+            component,
+            midi_note: hit.midi_note,
+            channel: hit.channel,
+        });
+        self.handled[self.index] = true;
+        self.suppress_until_micros = hit.timestamp_micros + HIT_DEBOUNCE_MICROS;
+        self.advance();
+    }
+
+    /// Rejects the detected note and waits for a fresh hit on the same drum.
+    pub fn retry(&mut self) {
+        if !matches!(self.state, SetupWizardState::Confirming(_)) {
+            return;
+        }
+        if let Some(hit) = self.detected.take() {
+            self.suppress_until_micros = hit.timestamp_micros + HIT_DEBOUNCE_MICROS;
+        }
+        self.conflicting.clear();
+        self.state = SetupWizardState::Detecting(self.current_component().unwrap());
+    }
+
+    /// Skips the current component without mapping it.
+    pub fn skip(&mut self) {
+        if !matches!(
+            self.state,
+            SetupWizardState::Detecting(_) | SetupWizardState::Confirming(_)
+        ) {
+            return;
+        }
+        self.detected = None;
+        self.conflicting.clear();
+        self.handled[self.index] = true;
+        self.advance();
+    }
+
+    /// Moves back to the previous component so it can be done again.
+    /// Returns `true` if the wizard actually moved.
+    pub fn back(&mut self) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.index -= 1;
+        self.accepted[self.index] = None;
+        self.handled[self.index] = false;
+        self.detected = None;
+        self.conflicting.clear();
+        self.suppress_until_micros = 0;
+        self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[self.index]);
+        true
+    }
+
+    /// Finalizes the wizard into a configured kit. Only valid once all
+    /// components have been handled (`Completed`); skipped components are
+    /// simply absent from the configuration. The device is not stored by the
+    /// wizard itself — the caller supplies the MIDI device name it ran against.
+    pub fn finish(&mut self, device_name: &str) -> Option<DrumKitConfiguration> {
+        if self.state != SetupWizardState::Completed || self.finished {
+            return None;
+        }
+        self.finished = true;
+        let mut config = DrumKitConfiguration::new(device_name);
+        for slot in self.accepted.iter().flatten() {
+            config.set(slot.clone());
+        }
+        Some(config)
+    }
+
+    fn advance(&mut self) {
+        self.detected = None;
+        self.conflicting.clear();
+        self.index += 1;
+        if self.index >= SUPPORTED_COMPONENTS.len() {
+            self.state = SetupWizardState::Completed;
+        } else {
+            self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[self.index]);
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::midi::{MidiMessage, MessageKind};
+
+    fn note_on(ts: u64, channel: u8, note: u8, velocity: u8) -> MidiEvent {
+        MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::NoteOn,
+                channel: Some(channel), // 0-based like the parser produces
+                data1: Some(note),
+                data2: Some(velocity),
+                system_exclusive: None,
+            },
+            timestamp_micros: ts,
+        }
+    }
+
+    fn note_off(ts: u64, channel: u8, note: u8, velocity: u8) -> MidiEvent {
+        MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::NoteOff,
+                channel: Some(channel),
+                data1: Some(note),
+                data2: Some(velocity),
+                system_exclusive: None,
+            },
+            timestamp_micros: ts,
+        }
+    }
+
+    #[test]
+    fn accepts_detected_midi_note() {
+        let mut w = SetupWizard::new();
+        w.start();
+        assert_eq!(w.state(), SetupWizardState::Detecting(DrumComponent::Crash));
+
+        // Any velocity is recorded; note 49 on channel 10 (0-based 9).
+        assert!(w.handle_event(&note_on(1_000_000, 9, 49, 105)));
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Confirming(DrumComponent::Crash)
+        );
+        let hit = w.detected_hit().unwrap();
+        assert_eq!(hit.midi_note, 49);
+        assert_eq!(hit.channel, 10); // converted to 1-based display channel
+        assert_eq!(hit.velocity, 105);
+        assert_eq!(hit.timestamp_micros, 1_000_000); // original timestamp kept
+
+        w.accept();
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::Ride)
+        );
+        assert!(w.is_done(DrumComponent::Crash));
+        assert!(!w.is_done(DrumComponent::Ride));
+        assert_eq!(w.done_count(), 1);
+    }
+
+    #[test]
+    fn note_on_with_zero_velocity_is_treated_as_note_off() {
+        let mut w = SetupWizard::new();
+        w.start();
+        // Note On with velocity 0 must NOT be interpreted as a hit.
+        assert!(!w.handle_event(&note_on(5, 9, 49, 0)));
+        assert_eq!(w.state(), SetupWizardState::Detecting(DrumComponent::Crash));
+        assert!(w.detected_hit().is_none());
+    }
+
+    #[test]
+    fn note_off_is_not_a_hit() {
+        let mut w = SetupWizard::new();
+        w.start();
+        assert!(!w.handle_event(&note_off(7, 9, 49, 64)));
+        assert_eq!(w.state(), SetupWizardState::Detecting(DrumComponent::Crash));
+        assert!(w.detected_hit().is_none());
+    }
+
+    #[test]
+    fn retry_discards_detected_note_and_waits_again() {
+        let mut w = SetupWizard::new();
+        w.start();
+        w.handle_event(&note_on(1_000_000, 9, 49, 105));
+        assert!(w.detected_hit().is_some());
+
+        w.retry();
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::Crash)
+        );
+        assert!(w.detected_hit().is_none());
+
+        // The same (flam-like) note within the debounce window is suppressed.
+        assert!(!w.handle_event(&note_on(1_000_030, 9, 49, 104)));
+        assert!(w.detected_hit().is_none());
+
+        // A later, fresh hit is captured again.
+        assert!(w.handle_event(&note_on(3_000_000, 9, 62, 90)));
+        let hit = w.detected_hit().unwrap();
+        assert_eq!(hit.midi_note, 62);
+    }
+
+    #[test]
+    fn cancel_discards_everything() {
+        let mut w = SetupWizard::new();
+        w.start();
+        w.handle_event(&note_on(100, 9, 49, 100));
+        w.accept();
+        assert_eq!(w.done_count(), 1);
+
+        w.cancel();
+        assert_eq!(w.state(), SetupWizardState::Canceled);
+        assert_eq!(w.done_count(), 0);
+        assert!(w.detected_hit().is_none());
+
+        // No further inputs can happen after cancellation.
+        assert!(!w.handle_event(&note_on(200, 9, 49, 100)));
+        w.accept(); // no-op, must not panic or change anything
+        assert_eq!(w.state(), SetupWizardState::Canceled);
+    }
+
+    #[test]
+    fn completing_setup_builds_configuration() {
+        // Notes chosen per component; deliberately NOT the typical GM layout to
+        // prove the wizard learns whatever the device sends.
+        let notes = [49u8, 51, 42, 38, 36, 48, 47, 45];
+        let mut w = SetupWizard::new();
+        w.start();
+
+        let mut ts = 100u64;
+        for (i, component) in SUPPORTED_COMPONENTS.iter().enumerate() {
+            assert_eq!(w.current_component(), Some(*component));
+            assert!(w.handle_event(&note_on(ts, 9, notes[i], 100 + i as u8)));
+            w.accept();
+            assert!(w.is_done(*component));
+            ts += 100_000;
+        }
+
+        assert_eq!(w.state(), SetupWizardState::Completed);
+        assert_eq!(w.done_count(), 8);
+
+        let config = w.finish("NUX DM-1").expect("finish should succeed");
+        assert_eq!(config.device_name, "NUX DM-1");
+        assert_eq!(config.mapped_count(), 8);
+        for (i, component) in SUPPORTED_COMPONENTS.iter().enumerate() {
+            assert_eq!(config.note_for(*component), Some(notes[i]));
+            assert_eq!(config.channel_for(*component), Some(10));
+        }
+    }
+#[test]
+    fn skipping_a_component_advances_without_mapping() {
+        let mut w = SetupWizard::new();
+        w.start();
+        // Crash connects, then the user skips Ride.
+        w.handle_event(&note_on(100, 9, 49, 100));
+        w.accept();
+        w.skip();
+
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::HiHat)
+        );
+        assert!(w.is_done(DrumComponent::Crash));
+        assert!(!w.is_done(DrumComponent::Ride));
+        assert_eq!(w.done_count(), 1);
+
+        // Skip the rest to reach the end.
+        for _ in 0..6 {
+            w.skip();
+        }
+        assert_eq!(w.state(), SetupWizardState::Completed);
+
+        let config = w.finish("Kit").unwrap();
+        assert_eq!(config.mapped_count(), 1);
+        assert_eq!(config.note_for(DrumComponent::Crash), Some(49));
+        assert!(config.get(DrumComponent::Ride).is_none());
+    }
+
+    #[test]
+    fn close_notes_do_not_assign_multiple_notes_to_one_drum() {
+        let mut w = SetupWizard::new();
+        w.start();
+
+        // First note captured.
+        assert!(w.handle_event(&note_on(1_000_000, 9, 49, 100)));
+        assert_eq!(w.detected_hit().unwrap().midi_note, 49);
+
+        // A second, different note arriving 1 ms later is a "conflict", not a
+        // second mapping: the wizard stays on the same single candidate.
+        assert!(!w.handle_event(&note_on(1_001_000, 9, 51, 100)));
+        assert_eq!(w.detected_hit().unwrap().midi_note, 49);
+        assert_eq!(w.conflicting_hits().len(), 1);
+        assert_eq!(w.conflicting_hits()[0].midi_note, 51);
+
+        // Repeats of the same conflict are not recorded again.
+        assert!(!w.handle_event(&note_on(1_002_000, 9, 51, 100)));
+        assert_eq!(w.conflicting_hits().len(), 1);
+
+        // Accepting maps only the original note.
+        w.accept();
+        assert!(w.is_done(DrumComponent::Crash));
+        assert!(!w.is_done(DrumComponent::Ride));
+        assert!(w.conflicting_hits().is_empty());
+    }
+
+    #[test]
+    fn debounce_keeps_flam_out_of_next_prompt() {
+        let mut w = SetupWizard::new();
+        w.start();
+
+        // Crash hit at t=1_000_000, accepted.
+        w.handle_event(&note_on(1_000_000, 9, 49, 100));
+        w.accept();
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::Ride)
+        );
+
+        // A flam on the crash pad 20 ms later must not be captured as Ride.
+        assert!(!w.handle_event(&note_on(1_020_000, 9, 49, 99)));
+        assert!(w.detected_hit().is_none());
+
+        // A genuine Ride hit later is captured normally.
+        assert!(w.handle_event(&note_on(2_000_000, 9, 51, 90)));
+        assert_eq!(w.detected_hit().unwrap().midi_note, 51);
+    }
+
+    #[test]
+    fn back_returns_to_previous_component() {
+        let mut w = SetupWizard::new();
+        w.start();
+        w.handle_event(&note_on(3_000_000, 9, 49, 100));
+        w.accept();
+        w.handle_event(&note_on(4_000_000, 9, 51, 100));
+        w.accept();
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::HiHat)
+        );
+
+        assert!(w.can_go_back());
+        assert!(w.back());
+        assert_eq!(
+            w.state(),
+            SetupWizardState::Detecting(DrumComponent::Ride)
+        );
+        // The previous mapping for Ride was invalidated for re-detection.
+        assert!(!w.is_done(DrumComponent::Ride));
+        assert!(w.is_done(DrumComponent::Crash));
+    }
+
+    #[test]
+    fn cannot_finish_before_all_components_handled() {
+        let mut w = SetupWizard::new();
+        w.start();
+        w.handle_event(&note_on(100, 9, 49, 100));
+        w.accept();
+        assert!(w.finish("Kit").is_none());
+    }
+
+    #[test]
+    fn dismissive_non_note_events_are_ignored() {
+        let mut w = SetupWizard::new();
+        w.start();
+        // Control change / program change must not trigger a hit.
+        let cc = MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::ControlChange,
+                channel: Some(9),
+                data1: Some(1),
+                data2: Some(127),
+                system_exclusive: None,
+            },
+            timestamp_micros: 1,
+        };
+        assert!(!w.handle_event(&cc));
+        assert_eq!(w.state(), SetupWizardState::Detecting(DrumComponent::Crash));
+    }
+
+    #[test]
+    fn detected_hit_from_parser_output() {
+        // End-to-end: bytes through the streaming parser yield an event that
+        // the wizard recognises, using the parser's 1-based channel_number().
+        let mut p = crate::midi::MidiParser::new();
+        let events = p.push_bytes(123_456, &[0x99, 49, 105]); // ch 10 (0-based 9), note 49
+        assert_eq!(events.len(), 1);
+        let hit = DetectedHit::from_event(&events[0]).expect("hit expected");
+        assert_eq!(hit.midi_note, 49);
+        assert_eq!(hit.channel, 10);
+        assert_eq!(hit.velocity, 105);
+        assert_eq!(hit.timestamp_micros, 123_456);
+    }
+}

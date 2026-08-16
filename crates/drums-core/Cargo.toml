@@ -7,3 +7,5 @@ description = "Hardware-independent MIDI logic for the DRUMS practice applicatio
 
 [dependencies]
 midir.workspace = true
+serde.workspace = true
+toml.workspace = true
