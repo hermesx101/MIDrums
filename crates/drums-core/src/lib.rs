@@ -10,6 +10,7 @@ pub mod mapping;
 pub mod midi;
 pub mod performance;
 pub mod practice;
+pub mod session_history;
 pub mod time;
 
 pub use mapping::{
@@ -29,5 +30,9 @@ pub use performance::{
 pub use practice::{
     ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget,
     TargetState, TimingConfig, TimingJudgment,
+};
+pub use session_history::{
+    CompletedPracticeSession, DrumSessionStatistics, PracticeHitRecord, PracticeSessionStore,
+    SessionBuildMetadata, SessionStatistics, new_session_id,
 };
 pub use time::{Clock, SharedClock, SystemClock};

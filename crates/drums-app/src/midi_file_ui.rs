@@ -91,6 +91,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             .unwrap_or(std::cmp::Ordering::Equal),
     });
     let mut practice_path = None;
+    let mut analysis_path = None;
     let mut rename = None;
     let mut remove = None;
     for entry in &entries {
@@ -103,6 +104,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                 ui,
                 entry,
                 &mut practice_path,
+                &mut analysis_path,
                 &mut rename,
                 &mut remove,
             );
@@ -123,6 +125,11 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             Err(error) => app.midi_import_error = Some(error),
         }
     }
+    if let Some(path) = analysis_path {
+        app.analysis_track_path = Some(path);
+        app.analysis_session_id = None;
+        app.view = View::PerformanceAnalysis;
+    }
     library_edit_prompts(app, ui);
 }
 
@@ -131,6 +138,7 @@ fn library_card(
     ui: &mut egui::Ui,
     entry: &crate::track_library::LibraryEntry,
     practice_path: &mut Option<String>,
+    analysis_path: &mut Option<String>,
     rename: &mut Option<(String, String)>,
     remove: &mut Option<String>,
 ) {
@@ -166,7 +174,7 @@ fn library_card(
                     app.library_selected_path = Some(entry.path.clone());
                 }
                 title.on_hover_text("Select track");
-                library_card_menu(ui, entry, practice_path, rename, remove);
+                library_card_menu(ui, entry, practice_path, analysis_path, rename, remove);
             });
 
             ui.add_space(6.0);
@@ -191,16 +199,18 @@ fn library_card(
                 if entry.likely_drums {
                     ui.colored_label(egui::Color32::from_rgb(225, 185, 75), "LIKELY DRUMS");
                 }
-                if let Some(accuracy) = entry.last_accuracy {
-                    ui.label("Last practice: recorded");
+                let history = app.session_store.load_for_track(&entry.path).unwrap_or_default();
+                if let Some(latest) = history.first() {
                     ui.colored_label(
                         egui::Color32::from_rgb(90, 210, 135),
-                        format!("Best score: {accuracy:.1}%"),
+                        format!("Last: {:.1}%", latest.statistics.accuracy),
                     );
-                    ui.weak("PRACTICED");
+                    if let Some(best) = history.iter().max_by(|a, b| a.statistics.accuracy.total_cmp(&b.statistics.accuracy)) {
+                        ui.weak(format!("Best: {:.1}%", best.statistics.accuracy));
+                    }
+                    ui.weak(format!("Sessions: {}", history.len()));
                 } else {
-                    ui.weak("Last practice: never");
-                    ui.weak("NOT PRACTICED");
+                    ui.weak("Not practiced yet");
                 }
                 if active {
                     ui.colored_label(egui::Color32::from_rgb(90, 210, 135), "ACTIVE");
@@ -211,6 +221,9 @@ fn library_card(
             ui.horizontal(|ui| {
                 if ui.button("Practice  >").clicked() {
                     *practice_path = Some(entry.path.clone());
+                }
+                if ui.button("Performance Analysis").clicked() {
+                    *analysis_path = Some(entry.path.clone());
                 }
                 egui::CollapsingHeader::new("Details")
                     .default_open(false)
@@ -240,12 +253,17 @@ fn library_card_menu(
     ui: &mut egui::Ui,
     entry: &crate::track_library::LibraryEntry,
     practice_path: &mut Option<String>,
+    analysis_path: &mut Option<String>,
     rename: &mut Option<(String, String)>,
     remove: &mut Option<String>,
 ) {
     ui.menu_button("...", |ui| {
         if ui.button("Practice").clicked() {
             *practice_path = Some(entry.path.clone());
+            ui.close_menu();
+        }
+        if ui.button("Performance Analysis").clicked() {
+            *analysis_path = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Rename").clicked() {
@@ -575,24 +593,13 @@ fn practice_interface(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[Expected
     }
 
     if song_complete {
+        // A final hit can complete the session before the transport reaches its
+        // final tick, so completion itself (not only end-of-song) must persist.
+        app.persist_completed_session();
         let performance = app
             .practice_session
             .as_ref()
             .map(PracticePerformance::from_session);
-        if !app.completion_saved {
-            if let (Some(path), Some(performance)) = (&app.current_library_path, &performance) {
-                if let Some(entry) = app
-                    .track_library
-                    .iter_mut()
-                    .find(|entry| &entry.path == path)
-                {
-                    entry.last_accuracy = Some(performance.accuracy_percent());
-                    entry.last_practiced_at = Some(crate::track_library::now_seconds());
-                    let _ = crate::track_library::save(&app.track_library);
-                }
-            }
-            app.completion_saved = true;
-        }
         if let Some(performance) = &performance {
             show_performance_summary(ui, performance);
         }
@@ -603,6 +610,11 @@ fn practice_interface(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[Expected
             }
             if ui.button("Your Tracks").clicked() {
                 app.view = View::TrackLibrary;
+            }
+            if ui.button("Performance Analysis").clicked() {
+                app.analysis_track_path = app.current_library_path.clone();
+                app.analysis_session_id = None;
+                app.view = View::PerformanceAnalysis;
             }
         });
         practice_debug_details(app, ui);

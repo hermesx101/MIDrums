@@ -1,8 +1,10 @@
 //! Transport-synchronised metronome event generation.
 
+use serde::{Deserialize, Serialize};
+
 use super::{ExpectedNote, MidiTiming, MusicalPosition, MusicalPositionMap, MusicalTransport, TransportState};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Subdivision { Quarter, Eighth, Sixteenth }
 
 impl Subdivision {

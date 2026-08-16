@@ -18,6 +18,7 @@
 mod click_audio;
 mod mapping_ui;
 mod midi_file_ui;
+mod performance_analysis_ui;
 mod track_library;
 mod wizard_ui;
 
@@ -27,8 +28,9 @@ use std::time::Instant;
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SUPPORTED_COMPONENTS, SetupWizard};
 use drums_core::time::{SharedClock, SystemClock};
 use drums_core::{
-    ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport,
-    PortInfo, PracticeResult, PracticeSession, Subdivision, SubdivisionSuggestion, Timeline,
+    ActualHit, CompletedPracticeSession, MatchingConfig, Metronome, MidiBackend, MidiEvent,
+    MidiFile, MusicalTransport, PortInfo, PracticeResult, PracticeSession, PracticeSessionStore,
+    SessionBuildMetadata, Subdivision, SubdivisionSuggestion, Timeline, new_session_id,
     suggest_subdivision,
 };
 use eframe::egui;
@@ -44,6 +46,7 @@ enum View {
     Mapping,
     TrackLibrary,
     Practice,
+    PerformanceAnalysis,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,6 +57,16 @@ enum PracticeLoopMode {
     FourBars,
     EightBars,
     Custom,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveSessionRecording {
+    id: String,
+    track_id: String,
+    started_at_unix_ms: u64,
+    practice_bpm: f64,
+    time_signature: String,
+    subdivision: Subdivision,
 }
 
 impl PracticeLoopMode {
@@ -131,6 +144,8 @@ struct DrumApp {
     transport: Option<MusicalTransport>,
     timeline: Option<Timeline>,
     practice_session: Option<PracticeSession>,
+    session_store: PracticeSessionStore,
+    active_session_recording: Option<ActiveSessionRecording>,
     last_live_hit: Option<ActualHit>,
     displayed_practice_result: Option<PracticeResult>,
     displayed_result_since: Option<Instant>,
@@ -161,6 +176,8 @@ struct DrumApp {
     current_library_path: Option<String>,
     library_selected_path: Option<String>,
     completion_saved: bool,
+    analysis_track_path: Option<String>,
+    analysis_session_id: Option<String>,
     click_audio: click_audio::ClickAudio,
 }
 
@@ -215,6 +232,8 @@ impl DrumApp {
             transport: None,
             timeline: None,
             practice_session: None,
+            session_store: PracticeSessionStore::default(),
+            active_session_recording: None,
             last_live_hit: None,
             displayed_practice_result: None,
             displayed_result_since: None,
@@ -244,6 +263,8 @@ impl DrumApp {
             current_library_path: None,
             library_selected_path: None,
             completion_saved: false,
+            analysis_track_path: None,
+            analysis_session_id: None,
             click_audio: click_audio::ClickAudio::new(),
         }
     }
@@ -421,6 +442,7 @@ impl DrumApp {
     }
 
     fn rebuild_timeline(&mut self) {
+        self.active_session_recording = None;
         let (Some(file), Some(track), Some(transport)) = (
             &self.imported_midi,
             self.selected_drum_track,
@@ -462,6 +484,7 @@ impl DrumApp {
         self.current_library_path = Some(path.to_string());
         self.library_selected_path = Some(path.to_string());
         self.completion_saved = false;
+        self.active_session_recording = None;
         self.rebuild_timeline();
         self.metronome.reset();
         self.last_transport_update = Instant::now();
@@ -470,6 +493,7 @@ impl DrumApp {
 
     fn restart_practice(&mut self, play: bool) {
         self.completion_saved = false;
+        self.active_session_recording = None;
         self.count_in_active = false;
         let Some(transport) = self.transport.as_mut() else {
             return;
@@ -507,6 +531,80 @@ impl DrumApp {
         self.displayed_practice_result = None;
         self.displayed_result_since = None;
         self.observed_practice_result_count = 0;
+        self.active_session_recording = None;
+    }
+
+    fn begin_session_recording_if_needed(&mut self) {
+        if self.active_session_recording.is_some() || self.count_in_active {
+            return;
+        }
+        let (Some(transport), Some(track_id)) =
+            (self.transport.as_ref(), self.current_library_path.clone())
+        else {
+            return;
+        };
+        if !transport.is_playing() {
+            return;
+        }
+        let started_at_unix_ms = unix_time_millis();
+        let (numerator, denominator) = transport.position_map().time_signature_at_tick(0);
+        self.active_session_recording = Some(ActiveSessionRecording {
+            id: new_session_id(&track_id, started_at_unix_ms),
+            track_id,
+            started_at_unix_ms,
+            practice_bpm: transport.practice_starting_bpm(),
+            time_signature: format!("{numerator}/{denominator}"),
+            subdivision: self.metronome.subdivision(),
+        });
+    }
+
+    fn persist_completed_session(&mut self) {
+        if self.completion_saved {
+            return;
+        }
+        let Some(recording) = self.active_session_recording.take() else {
+            self.status = "Completed practice was not stored because no active session was recorded.".into();
+            self.completion_saved = true;
+            return;
+        };
+        let (Some(session), Some(transport)) = (&self.practice_session, &self.transport) else {
+            self.status = "Completed practice was not stored because session data was unavailable.".into();
+            self.completion_saved = true;
+            return;
+        };
+        let completed_at_unix_ms = unix_time_millis();
+        let completed = CompletedPracticeSession::from_practice_session(
+            session,
+            transport,
+            SessionBuildMetadata {
+                id: recording.id,
+                track_id: recording.track_id.clone(),
+                started_at_unix_ms: recording.started_at_unix_ms,
+                completed_at_unix_ms,
+                practice_bpm: recording.practice_bpm,
+                time_signature: recording.time_signature,
+                subdivision: recording.subdivision,
+            },
+        );
+        let accuracy = completed.statistics.accuracy;
+        match self.session_store.append(completed) {
+            Ok(()) => {
+                if let Some(entry) = self
+                    .track_library
+                    .iter_mut()
+                    .find(|entry| entry.path == recording.track_id)
+                {
+                    entry.last_accuracy = Some(accuracy);
+                    entry.last_practiced_at = Some(completed_at_unix_ms / 1_000);
+                    let _ = track_library::save(&self.track_library);
+                }
+                self.status = format!("Practice session saved ({accuracy:.1}% accuracy).");
+            }
+            Err(error) => {
+                self.status = format!("Could not save completed practice session: {error}");
+            }
+        }
+        self.completion_saved = true;
     }
 
     fn active_loop_region(&self) -> Option<(u64, u64)> {
@@ -567,6 +665,7 @@ impl eframe::App for DrumApp {
         }
 
         let now = Instant::now();
+        self.begin_session_recording_if_needed();
         let elapsed = now.duration_since(self.last_transport_update);
         self.last_transport_update = now;
         let mut reached_song_end = false;
@@ -643,6 +742,9 @@ impl eframe::App for DrumApp {
                 self.displayed_result_since = Some(now);
             }
             self.observed_practice_result_count = result_count;
+        }
+        if reached_song_end {
+            self.persist_completed_session();
         }
 
         if false {
@@ -926,6 +1028,7 @@ impl eframe::App for DrumApp {
                             View::Setup => wizard_ui::show(self, ui),
                             View::Mapping => mapping_ui::show(self, ui),
                             View::TrackLibrary => midi_file_ui::show(self, ui),
+                            View::PerformanceAnalysis => performance_analysis_ui::show(self, ui),
                             View::Practice => unreachable!(),
                         }
                     });
@@ -1076,6 +1179,14 @@ fn fmt_opt(value: Option<u8>) -> String {
 
 fn timestamp_text(us: u64) -> String {
     format!("{} us (~{:.3} s)", us, us as f64 / 1_000_000.0)
+}
+
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn fmt_event(ev: &MidiEvent) -> String {

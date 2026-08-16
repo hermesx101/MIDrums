@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::mapping::{DrumComponent, DrumKitConfiguration};
 use crate::midi::{ExpectedNote, MessageKind, MidiEvent, MusicalTransport};
 
@@ -69,7 +71,7 @@ impl ActualHit {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PracticeResultKind {
     CorrectHit,
     WrongDrum,
@@ -77,7 +79,7 @@ pub enum PracticeResultKind {
     Ignored,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimingJudgment {
     Early,
     Good,
