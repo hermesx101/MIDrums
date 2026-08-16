@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Subdivision, Timeline};
+use drums_core::{suggest_subdivision, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Subdivision, SubdivisionSuggestion, Timeline};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -82,6 +82,8 @@ struct DrumApp {
     timeline: Option<Timeline>,
     last_transport_update: Instant,
     metronome: Metronome,
+    subdivision_auto: bool,
+    subdivision_suggestion: Option<SubdivisionSuggestion>,
     metronome_enabled: bool,
     click_audio: click_audio::ClickAudio,
 }
@@ -129,6 +131,8 @@ impl DrumApp {
             timeline: None,
             last_transport_update: Instant::now(),
             metronome: Metronome::new(Subdivision::Eighth),
+            subdivision_auto: true,
+            subdivision_suggestion: None,
             metronome_enabled: false,
             click_audio: click_audio::ClickAudio::new(),
         }
@@ -227,6 +231,9 @@ impl DrumApp {
             return;
         };
         let notes = file.expected_notes_for_track(track, self.active_config.as_ref());
+        let suggestion = suggest_subdivision(file.timing, &notes);
+        self.subdivision_suggestion = Some(suggestion);
+        if self.subdivision_auto { self.metronome.set_subdivision(suggestion.subdivision); self.metronome.sync_to_transport(transport); }
         self.timeline = Some(Timeline::from_expected_notes(notes, transport.position_map(), file.duration_ticks));
     }
 }

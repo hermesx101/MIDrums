@@ -122,6 +122,16 @@ impl MusicalPositionMap {
     pub fn beats_per_measure_at_tick(&self, tick: u64) -> u8 {
         self.signatures.iter().filter(|signature| signature.tick <= tick).last().map(|signature| signature.numerator).unwrap_or(4)
     }
+
+    pub fn ticks_per_quarter(&self) -> Option<u16> {
+        match self.timing { MidiTiming::TicksPerQuarter(value) => Some(value), MidiTiming::Timecode { .. } => None }
+    }
+
+    pub fn time_signature_at_tick(&self, tick: u64) -> (u8, u32) {
+        self.signatures.iter().filter(|signature| signature.tick <= tick).last()
+            .map(|signature| (signature.numerator, signature.denominator()))
+            .unwrap_or((4, 4))
+    }
 }
 
 fn ticks_per_beat(ticks_per_quarter: u16, denominator_exponent: u8) -> u64 {
@@ -152,20 +162,27 @@ pub struct MusicalTransport {
     final_tick: u64,
     tempo_map: TempoMap,
     position_map: MusicalPositionMap,
+    tempo_scale: f64,
 }
 
 impl MusicalTransport {
     pub fn new(timing: MidiTiming, tempos: &[TempoEvent], signatures: &[TimeSignatureEvent], final_tick: u64) -> Self {
-        Self { state: TransportState::Stopped, current_tick: 0.0, final_tick, tempo_map: TempoMap::new(timing, tempos), position_map: MusicalPositionMap::new(timing, signatures) }
+        Self { state: TransportState::Stopped, current_tick: 0.0, final_tick, tempo_map: TempoMap::new(timing, tempos), position_map: MusicalPositionMap::new(timing, signatures), tempo_scale: 1.0 }
     }
     pub fn from_midi_file(file: &MidiFile) -> Self { Self::new(file.timing, &file.tempo_events, &file.time_signature_events, file.duration_ticks) }
     pub fn state(&self) -> TransportState { self.state }
     pub fn is_playing(&self) -> bool { self.state == TransportState::Playing }
     pub fn current_tick(&self) -> u64 { self.current_tick.round() as u64 }
     pub fn final_tick(&self) -> u64 { self.final_tick }
-    pub fn elapsed_seconds(&self) -> f64 { self.tempo_map.seconds_at_tick(self.current_tick) }
-    pub fn total_seconds(&self) -> f64 { self.tempo_map.seconds_at_tick(self.final_tick as f64) }
-    pub fn current_bpm(&self) -> f64 { self.tempo_map.bpm_at_tick(self.current_tick()) }
+    pub fn elapsed_seconds(&self) -> f64 { self.tempo_map.seconds_at_tick(self.current_tick) / self.tempo_scale }
+    pub fn total_seconds(&self) -> f64 { self.tempo_map.seconds_at_tick(self.final_tick as f64) / self.tempo_scale }
+    pub fn original_bpm(&self) -> f64 { self.tempo_map.bpm_at_tick(self.current_tick()) }
+    pub fn original_starting_bpm(&self) -> f64 { self.tempo_map.bpm_at_tick(0) }
+    pub fn current_bpm(&self) -> f64 { self.original_bpm() * self.tempo_scale }
+    pub fn practice_starting_bpm(&self) -> f64 { self.original_starting_bpm() * self.tempo_scale }
+    pub fn tempo_scale(&self) -> f64 { self.tempo_scale }
+    pub fn set_practice_bpm(&mut self, bpm: f64) { self.tempo_scale = bpm.clamp(20.0, 300.0) / self.original_starting_bpm(); }
+    pub fn reset_practice_tempo(&mut self) { self.tempo_scale = 1.0; }
     pub fn musical_position(&self) -> MusicalPosition { self.position_map.position_at_tick(self.current_tick()) }
     pub fn position_map(&self) -> &MusicalPositionMap { &self.position_map }
     pub fn play(&mut self) { if self.current_tick < self.final_tick as f64 { self.state = TransportState::Playing; } }
@@ -175,7 +192,8 @@ impl MusicalTransport {
     pub fn seek_to_end(&mut self) { self.current_tick = self.final_tick as f64; self.state = TransportState::Stopped; }
     pub fn advance_by(&mut self, elapsed: Duration) {
         if self.state != TransportState::Playing { return; }
-        let next = self.tempo_map.tick_at_seconds(self.elapsed_seconds() + elapsed.as_secs_f64());
+        let original_elapsed = self.tempo_map.seconds_at_tick(self.current_tick);
+        let next = self.tempo_map.tick_at_seconds(original_elapsed + elapsed.as_secs_f64() * self.tempo_scale);
         if next >= self.final_tick as f64 { self.current_tick = self.final_tick as f64; self.state = TransportState::Stopped; } else { self.current_tick = next; }
     }
 }
@@ -189,8 +207,47 @@ mod tests {
     #[test] fn seek_clamps_and_repositions() { let mut t = transport(60, 1000); t.seek(-2); assert_eq!(t.current_tick(), 0); t.seek(500); assert_eq!(t.current_tick(), 500); t.seek(5000); assert_eq!(t.current_tick(), 1000); }
     #[test] fn bpm_60_and_120_conversions_are_correct() { let sixty = transport(60, 2000); assert_eq!(sixty.elapsed_seconds(), 0.0); assert_eq!(sixty.tempo_map.seconds_at_tick(480.0), 1.0); assert_eq!(sixty.tempo_map.seconds_at_tick(1440.0), 3.0); let fast = transport(120, 2000); assert_eq!(fast.tempo_map.seconds_at_tick(480.0), 0.5); assert_eq!(fast.tempo_map.seconds_at_tick(960.0), 1.0); }
     #[test] fn tempo_changes_convert_both_directions() { let map = TempoMap::new(MidiTiming::TicksPerQuarter(480), &[TempoEvent { tick: 0, micros_per_quarter: 500_000 }, TempoEvent { tick: 480, micros_per_quarter: 1_000_000 }]); assert_eq!(map.seconds_at_tick(480.0), 0.5); assert_eq!(map.seconds_at_tick(960.0), 1.5); assert_eq!(map.tick_at_seconds(1.5), 960.0); }
+    #[test] fn transport_advances_across_multiple_tempo_changes_and_updates_bpm() {
+        let mut t = MusicalTransport::new(
+            MidiTiming::TicksPerQuarter(480),
+            &[
+                TempoEvent { tick: 0, micros_per_quarter: 500_000 },
+                TempoEvent { tick: 480, micros_per_quarter: 600_000 },
+                TempoEvent { tick: 960, micros_per_quarter: 60_000_000 / 140 },
+            ],
+            &[],
+            2_000,
+        );
+        t.play();
+        t.advance_by(Duration::from_millis(500));
+        assert_eq!(t.current_tick(), 480);
+        assert_eq!(t.current_bpm(), 100.0);
+        t.advance_by(Duration::from_millis(600));
+        assert_eq!(t.current_tick(), 960);
+        assert!((t.current_bpm() - 140.0).abs() < 0.001);
+    }
+    #[test] fn practice_tempo_scales_map_preserves_original_and_ticks_and_resets() {
+        let mut t = MusicalTransport::new(MidiTiming::TicksPerQuarter(480), &[TempoEvent { tick: 0, micros_per_quarter: 500_000 }, TempoEvent { tick: 480, micros_per_quarter: 600_000 }, TempoEvent { tick: 960, micros_per_quarter: 60_000_000 / 140 }], &[], 2_000);
+        assert_eq!(t.original_starting_bpm(), 120.0);
+        t.set_practice_bpm(80.0);
+        assert!((t.tempo_scale() - 2.0 / 3.0).abs() < 0.0001);
+        assert_eq!(t.practice_starting_bpm(), 80.0);
+        t.seek(480);
+        assert_eq!(t.current_tick(), 480);
+        assert_eq!(t.original_bpm(), 100.0);
+        assert!((t.current_bpm() - 66.6667).abs() < 0.001);
+        t.seek(960);
+        assert_eq!(t.current_tick(), 960);
+        assert!((t.current_bpm() - 93.3333).abs() < 0.001);
+        t.reset_practice_tempo();
+        assert_eq!(t.tempo_scale(), 1.0);
+        assert!((t.current_bpm() - 140.0).abs() < 0.001);
+    }
+    #[test] fn practice_bpm_is_clamped() { let mut t = transport(120, 2_000); t.set_practice_bpm(1.0); assert_eq!(t.practice_starting_bpm(), 20.0); t.set_practice_bpm(999.0); assert_eq!(t.practice_starting_bpm(), 300.0); }
+    #[test] fn practice_tempo_changes_real_time_not_musical_ticks() { let mut normal = transport(120, 2_000); let mut slow = normal.clone(); slow.set_practice_bpm(60.0); normal.play(); slow.play(); normal.advance_by(Duration::from_millis(500)); slow.advance_by(Duration::from_millis(500)); assert_eq!(normal.current_tick(), 480); assert_eq!(slow.current_tick(), 240); slow.seek(960); let tick = slow.current_tick(); slow.set_practice_bpm(90.0); assert_eq!(slow.current_tick(), tick); }
     #[test] fn musical_positions_support_common_signatures() { let four = MusicalPositionMap::new(MidiTiming::TicksPerQuarter(480), &[]); assert_eq!(four.position_at_tick(1920), MusicalPosition { measure: 2, beat: 1, ticks_into_beat: 0, ticks_per_beat: 480 }); let three = MusicalPositionMap::new(MidiTiming::TicksPerQuarter(480), &[TimeSignatureEvent { tick: 0, numerator: 3, denominator_exponent: 2, clocks_per_click: 24, thirty_seconds_per_quarter: 8 }]); assert_eq!(three.position_at_tick(1440), MusicalPosition { measure: 2, beat: 1, ticks_into_beat: 0, ticks_per_beat: 480 }); let six_eight = MusicalPositionMap::new(MidiTiming::TicksPerQuarter(480), &[TimeSignatureEvent { tick: 0, numerator: 6, denominator_exponent: 3, clocks_per_click: 36, thirty_seconds_per_quarter: 8 }]); assert_eq!(six_eight.position_at_tick(1440), MusicalPosition { measure: 2, beat: 1, ticks_into_beat: 0, ticks_per_beat: 240 }); }
     #[test] fn end_of_song_clamps_and_stops() { let mut t = transport(60, 480); t.play(); t.advance_by(Duration::from_secs(2)); assert_eq!(t.current_tick(), 480); assert_eq!(t.state(), TransportState::Stopped); }
+    #[test] fn play_at_end_is_a_defined_no_op_until_repositioned() { let mut t = transport(60, 480); t.seek_to_end(); t.play(); t.advance_by(Duration::from_secs(1)); assert_eq!(t.current_tick(), 480); assert_eq!(t.state(), TransportState::Stopped); t.seek(0); t.play(); assert_eq!(t.state(), TransportState::Playing); }
     #[test] fn advancement_is_independent_of_gui_frame_rate() { let mut one_frame = transport(60, 2_000); let mut ten_frames = transport(60, 2_000); one_frame.play(); ten_frames.play(); one_frame.advance_by(Duration::from_secs(1)); for _ in 0..10 { ten_frames.advance_by(Duration::from_millis(100)); } assert_eq!(one_frame.current_tick(), ten_frames.current_tick()); }
     #[test] fn timeline_reuses_expected_notes_and_assigns_musical_positions() { let map = MusicalPositionMap::new(MidiTiming::TicksPerQuarter(480), &[]); let note = ExpectedNote { tick: 480, timestamp_seconds: 1.0, midi_note: 36, velocity: 100, channel: 9, track: 0, drum_component: None, target_component: None }; let timeline = Timeline::from_expected_notes(vec![note], &map, 960); assert_eq!(timeline.events.len(), 1); assert_eq!(timeline.events[0].expected.midi_note, 36); assert_eq!(timeline.events[0].position.beat, 2); }
 }

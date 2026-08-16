@@ -333,6 +333,22 @@ mod tests {
         assert_eq!(general_midi_component(12), None);
     }
     #[test]
+    fn unknown_notes_are_preserved_without_guessing_or_using_hardware_notes() {
+        let mut track = vec![0, 0x99, 12, 100, 0, 0x99, 36, 110]; track.extend(end());
+        let file = MidiFile::parse("unknown.mid", &midi(&[track], 0)).unwrap();
+        let mut mapping = DrumKitConfiguration::new("NUX DM-1");
+        mapping.set(DrumMapping { component: DrumComponent::Kick, midi_note: 24, channel: 10 });
+        let expected = file.expected_notes_for_track(0, Some(&mapping));
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].midi_note, 12);
+        assert_eq!(expected[0].drum_component, None);
+        assert_eq!(expected[0].target_component, None);
+        assert_eq!(expected[1].midi_note, 36);
+        assert_eq!(expected[1].drum_component, Some(DrumComponent::Kick));
+        assert_eq!(expected[1].target_component, Some(DrumComponent::Kick));
+        assert_eq!(mapping.note_for(DrumComponent::Kick), Some(24));
+    }
+    #[test]
     fn imports_from_a_midi_path_and_reports_path_errors() {
         let path = std::env::temp_dir().join(format!("drums_phase3a_{}.mid", std::process::id()));
         let mut track = vec![0, 0x99, 36, 100]; track.extend(end());

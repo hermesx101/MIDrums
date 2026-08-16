@@ -57,13 +57,29 @@ fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
         transport.seek(requested_tick.min(i64::MAX as u64) as i64); app.metronome.sync_to_transport(transport);
     }
     let musical = transport.musical_position();
+    let (numerator, denominator) = transport.position_map().time_signature_at_tick(transport.current_tick());
+    let ppq = transport.position_map().ticks_per_quarter();
     egui::Grid::new("transport_position").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
         ui.label("State:"); ui.monospace(format!("{:?}", transport.state())); ui.end_row();
-        ui.label("Tempo:"); ui.monospace(format!("{:.1} BPM", transport.current_bpm())); ui.end_row();
         ui.label("Musical position:"); ui.monospace(format!("Bar {}  Beat {}  + {}/{} ticks", musical.measure, musical.beat, musical.ticks_into_beat, musical.ticks_per_beat)); ui.end_row();
         ui.label("Elapsed:"); ui.monospace(format!("{} / {}", time_text(transport.elapsed_seconds()), time_text(transport.total_seconds()))); ui.end_row();
         ui.label("Current tick:"); ui.monospace(format!("{} / {}", transport.current_tick(), transport.final_tick())); ui.end_row();
+        ui.label("Time signature:"); ui.monospace(format!("{numerator}/{denominator}")); ui.end_row();
+        ui.label("PPQ:"); ui.monospace(ppq.map(|value| value.to_string()).unwrap_or_else(|| "SMPTE timing".to_string())); ui.end_row();
     });
+    ui.add_space(10.0);
+    ui.heading("TEMPO");
+    ui.label(format!("Original MIDI: {:.1} BPM{}", transport.original_bpm(), if transport.tempo_scale() != 1.0 { " (preserved)" } else { "" }));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Practice:").size(18.0));
+        let decrement = ui.add_sized([44.0, 36.0], egui::Button::new(egui::RichText::new("−").size(24.0))).clicked();
+        ui.label(egui::RichText::new(format!("{:.0} BPM", transport.practice_starting_bpm())).strong().size(26.0));
+        let increment = ui.add_sized([44.0, 36.0], egui::Button::new(egui::RichText::new("+").size(24.0))).clicked();
+        if decrement { transport.set_practice_bpm(transport.practice_starting_bpm() - 1.0); }
+        if increment { transport.set_practice_bpm(transport.practice_starting_bpm() + 1.0); }
+        if ui.button("Reset to MIDI tempo").clicked() { transport.reset_practice_tempo(); }
+    });
+    if transport.tempo_scale() != 1.0 { ui.weak(format!("Current effective tempo: {:.1} BPM (original current tempo: {:.1} BPM)", transport.current_bpm(), transport.original_bpm())); }
     if let Some(timeline) = &app.timeline { ui.weak(format!("Timeline model: {} expected events.", timeline.events.len())); }
     ui.separator();
 }
@@ -75,13 +91,24 @@ fn metronome_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
     // `Metronome` has mutable state, so subdivision selection is applied via
     // independent controls rather than replacing the generator.
     ui.horizontal(|ui| {
-        let mut subdivision = app.metronome.subdivision();
-        ui.radio_value(&mut subdivision, Subdivision::Quarter, "Quarter notes");
-        ui.radio_value(&mut subdivision, Subdivision::Eighth, "Eighth notes");
-        ui.radio_value(&mut subdivision, Subdivision::Sixteenth, "Sixteenth notes");
-        if subdivision != app.metronome.subdivision() { app.metronome.set_subdivision(subdivision); app.metronome.sync_to_transport(transport); }
+        let auto_clicked = ui.selectable_label(app.subdivision_auto, "Auto").clicked();
+        if auto_clicked {
+            app.subdivision_auto = true;
+            if let Some(suggestion) = app.subdivision_suggestion { app.metronome.set_subdivision(suggestion.subdivision); app.metronome.sync_to_transport(transport); }
+        }
+        for subdivision in [Subdivision::Quarter, Subdivision::Eighth, Subdivision::Sixteenth] {
+            if ui.selectable_label(!app.subdivision_auto && app.metronome.subdivision() == subdivision, subdivision.label()).clicked() {
+                app.subdivision_auto = false;
+                app.metronome.set_subdivision(subdivision);
+                app.metronome.sync_to_transport(transport);
+            }
+        }
         ui.weak(if app.click_audio.available() { "Synthesized click output available" } else { "Audio output unavailable" });
     });
+    if let Some(suggestion) = app.subdivision_suggestion {
+        ui.label(format!("Suggested: {} notes   •   Confidence: {}", suggestion.subdivision.label(), suggestion.confidence.label()));
+        ui.weak("Auto analyzes MIDI tick positions only; it never moves or quantizes notes.");
+    }
     let tokens = count_tokens(transport.position_map(), transport.current_tick(), app.metronome.subdivision());
     ui.horizontal_wrapped(|ui| { for token in tokens { if token.active { ui.colored_label(egui::Color32::from_rgb(120, 190, 255), egui::RichText::new(token.label).strong().size(22.0)); } else { ui.label(egui::RichText::new(token.label).size(20.0)); } } });
     ui.weak(format!("Tempo: {:.1} BPM  •  {} subdivision", transport.current_bpm(), app.metronome.subdivision().label()));
