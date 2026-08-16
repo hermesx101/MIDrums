@@ -192,11 +192,13 @@ mod tests {
         let mut config = DrumKitConfiguration::new(device);
         config.set(DrumMapping {
             component: DrumComponent::Crash,
+            event_kind: Default::default(),
             midi_note: 49,
             channel: 10,
         });
         config.set(DrumMapping {
             component: DrumComponent::Snare,
+            event_kind: Default::default(),
             midi_note: 38,
             channel: 10,
         });
@@ -235,12 +237,14 @@ mod tests {
         let mut kit_a = sample_config("Kit A");
         kit_a.set(DrumMapping {
             component: DrumComponent::Kick,
+            event_kind: Default::default(),
             midi_note: 36,
             channel: 10,
         });
         let mut kit_b = sample_config("Kit B");
         kit_b.set(DrumMapping {
             component: DrumComponent::Kick,
+            event_kind: Default::default(),
             midi_note: 22, // different layout
             channel: 1,
         });

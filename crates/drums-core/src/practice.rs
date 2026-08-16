@@ -48,7 +48,11 @@ impl ActualHit {
         let component = mapping
             .mappings
             .iter()
-            .find(|entry| entry.midi_note == note && entry.channel == channel + 1)
+            .find(|entry| {
+                entry.event_kind == crate::mapping::MappingEventKind::Note
+                    && entry.midi_note == note
+                    && entry.channel == channel + 1
+            })
             .map(|entry| entry.component);
         let queue_delay_seconds =
             observed_at_micros.saturating_sub(event.timestamp_micros) as f64 / 1_000_000.0;
@@ -427,6 +431,31 @@ impl PracticeSession {
             }
         }
     }
+
+    /// Finalizes pending targets, then rearms only the expected events in a
+    /// repeated half-open loop region. Previous results remain intact so
+    /// performance accumulates per encounter.
+    pub fn on_loop_wrap(&mut self, start_tick: u64, end_tick: u64) {
+        for (index, expected) in self.expected.iter().enumerate() {
+            if expected.tick >= start_tick && expected.tick < end_tick {
+                if !self.consumed[index] {
+                    self.results.push(PracticeResult {
+                        kind: if expected.drum_component.is_some() {
+                            PracticeResultKind::Missed
+                        } else {
+                            PracticeResultKind::Ignored
+                        },
+                        expected: Some(expected.clone()),
+                        actual: None,
+                        timing_difference_ticks: None,
+                        timing_difference_micros: None,
+                        timing_judgment: None,
+                    });
+                }
+                self.consumed[index] = false;
+            }
+        }
+    }
     pub fn on_stop(&mut self) {
         self.reset();
     }
@@ -744,6 +773,7 @@ mod tests {
         let mut mapping = DrumKitConfiguration::new("NUX DM-1");
         mapping.set(DrumMapping {
             component: DrumComponent::Kick,
+            event_kind: Default::default(),
             midi_note: 24,
             channel: 10,
         });
@@ -766,7 +796,13 @@ mod tests {
     #[test]
     fn unmapped_and_non_hit_midi_are_handled_safely() {
         let t = transport();
-        let mapping = DrumKitConfiguration::new("NUX");
+        let mut mapping = DrumKitConfiguration::new("NUX");
+        mapping.set(DrumMapping {
+            component: DrumComponent::HiHatPedalPosition,
+            event_kind: crate::mapping::MappingEventKind::ControlChange,
+            midi_note: 4,
+            channel: 10,
+        });
         let unmapped = MidiEvent {
             message: MidiMessage {
                 kind: MessageKind::NoteOn,
@@ -794,6 +830,17 @@ mod tests {
             timestamp_micros: 2,
         };
         assert!(ActualHit::from_midi_event(&off, &mapping, &t).is_none());
+        let pedal_position = MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::ControlChange,
+                channel: Some(9),
+                data1: Some(4),
+                data2: Some(82),
+                system_exclusive: None,
+            },
+            timestamp_micros: 3,
+        };
+        assert!(ActualHit::from_midi_event(&pedal_position, &mapping, &t).is_none());
     }
     #[test]
     fn callback_timestamp_removes_gui_queue_delay_from_actual_tick() {
@@ -803,6 +850,7 @@ mod tests {
         let mut mapping = DrumKitConfiguration::new("NUX");
         mapping.set(DrumMapping {
             component: DrumComponent::Kick,
+            event_kind: Default::default(),
             midi_note: 24,
             channel: 10,
         });
@@ -886,6 +934,25 @@ mod tests {
             Some(DrumComponent::Snare)
         );
         assert_eq!(s.pending_count(), 1);
+    }
+
+    #[test]
+    fn loop_wrap_rearms_region_and_retains_accumulated_results() {
+        let t = transport();
+        let mut s = session(vec![expected(Some(DrumComponent::Kick), 960)]);
+        s.record_hit(actual(Some(DrumComponent::Kick), 960), &t);
+        assert_eq!(s.results().len(), 1);
+        s.on_loop_wrap(900, 1_100);
+        assert_eq!(s.results().len(), 1);
+        assert_eq!(s.pending_count(), 1);
+        s.record_hit(actual(Some(DrumComponent::Kick), 960), &t);
+        assert_eq!(
+            s.results()
+                .iter()
+                .filter(|result| result.kind == PracticeResultKind::CorrectHit)
+                .count(),
+            2
+        );
     }
     #[test]
     fn simultaneous_notes_form_one_target_group_and_one_hit_consumes_only_one() {

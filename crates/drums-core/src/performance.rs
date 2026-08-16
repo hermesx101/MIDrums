@@ -156,6 +156,10 @@ impl PracticePerformance {
         }
 
         for stats in per_component.values_mut() {
+            // A loop iteration creates a new evaluable encounter without
+            // duplicating the imported ExpectedNote. Reflect those repeated
+            // finalized outcomes in session totals.
+            stats.total_expected = stats.total_expected.max(stats.finalized);
             stats.mean_absolute_error_ms = (stats.timed_hits > 0)
                 .then(|| stats.timing_absolute_sum_ms / stats.timed_hits as f64);
         }
@@ -500,5 +504,28 @@ mod tests {
         session.on_seek_to_tick(0, &t);
         let reset = PracticePerformance::from_session(&session);
         assert_eq!((reset.correct_hits, reset.finalized_expected), (0, 0));
+    }
+
+    #[test]
+    fn repeated_loop_encounters_expand_performance_denominator() {
+        let t = transport();
+        let mut session = PracticeSession::new(
+            vec![note(DrumComponent::Kick, 1_000)],
+            MatchingConfig::default(),
+        );
+        session.record_hit(hit(DrumComponent::Kick, 1_000), &t);
+        session.on_loop_wrap(900, 1_100);
+        session.record_hit(hit(DrumComponent::Kick, 1_000), &t);
+        let stats = PracticePerformance::from_session(&session);
+        assert_eq!(
+            (
+                stats.correct_hits,
+                stats.finalized_expected,
+                stats.total_expected
+            ),
+            (2, 2, 2)
+        );
+        assert_eq!(stats.per_component[&DrumComponent::Kick].total_expected, 2);
+        assert_eq!(stats.accuracy_percent(), 100.0);
     }
 }

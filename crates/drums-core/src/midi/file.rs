@@ -312,7 +312,7 @@ mod tests {
         let mut drums = vec![0, 0xff, 0x03, 5, b'D', b'r', b'u', b'm', b's', 0, 0x99, 36, 100, 0, 0x99, 36, 0, 0x83, 0x60, 0x99, 38, 110]; drums.extend(end());
         let file = MidiFile::parse("fixture.mid", &midi(&[conductor, drums], 1)).unwrap();
         assert_eq!(file.format, SmfFormat::Format1); assert_eq!(file.timing, MidiTiming::TicksPerQuarter(480)); assert_eq!(file.tracks.len(), 2); assert_eq!(file.tracks[1].name.as_deref(), Some("Drums")); assert_eq!(file.tracks[1].note_event_count, 2); assert_eq!(file.tracks[1].notes[1].tick, 480); assert_eq!(file.tracks[1].notes[1].velocity, 110); assert_eq!(file.tempo_events[0].bpm(), 120.0); assert_eq!(file.time_signature_events[0].denominator(), 4); assert_eq!(file.suggested_drum_track(), Some(1));
-        let mut mapping = DrumKitConfiguration::new("kit"); mapping.set(DrumMapping { component: DrumComponent::Kick, midi_note: 24, channel: 10 });
+        let mut mapping = DrumKitConfiguration::new("kit"); mapping.set(DrumMapping { component: DrumComponent::Kick, event_kind: Default::default(), midi_note: 24, channel: 10 });
         let expected = file.expected_notes_for_track(1, Some(&mapping)); assert_eq!(expected[0].drum_component, Some(DrumComponent::Kick)); assert_eq!(expected[0].target_component, Some(DrumComponent::Kick)); assert_eq!(expected[1].drum_component, Some(DrumComponent::Snare)); assert_eq!(expected[1].target_component, None);
     }
     #[test]
@@ -337,7 +337,7 @@ mod tests {
         let mut track = vec![0, 0x99, 12, 100, 0, 0x99, 36, 110]; track.extend(end());
         let file = MidiFile::parse("unknown.mid", &midi(&[track], 0)).unwrap();
         let mut mapping = DrumKitConfiguration::new("NUX DM-1");
-        mapping.set(DrumMapping { component: DrumComponent::Kick, midi_note: 24, channel: 10 });
+        mapping.set(DrumMapping { component: DrumComponent::Kick, event_kind: Default::default(), midi_note: 24, channel: 10 });
         let expected = file.expected_notes_for_track(0, Some(&mapping));
         assert_eq!(expected.len(), 2);
         assert_eq!(expected[0].midi_note, 12);

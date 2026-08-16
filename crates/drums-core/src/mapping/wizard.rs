@@ -24,7 +24,9 @@
 //!   [`HIT_DEBOUNCE_MICROS`] are ignored, so a double-trigger or a flam from
 //!   the previous pad cannot slide into the *next* component's prompt.
 
-use super::{DrumComponent, DrumKitConfiguration, DrumMapping, SUPPORTED_COMPONENTS};
+use super::{
+    DrumComponent, DrumKitConfiguration, DrumMapping, MappingEventKind, SUPPORTED_COMPONENTS,
+};
 use crate::midi::{MidiEvent, MessageKind};
 
 /// After a hit is accepted/retried, Note On events arriving within this window
@@ -39,6 +41,7 @@ pub const CONFLICT_WINDOW_MICROS: u64 = 250 * 1000; // 250 ms
 /// A drum hit detected from a MIDI event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DetectedHit {
+    pub event_kind: MappingEventKind,
     /// MIDI note number.
     pub midi_note: u8,
     /// MIDI channel as displayed, 1..=16.
@@ -54,17 +57,24 @@ impl DetectedHit {
     /// module docs, or `None` when the event is not a positive-velocity Note On.
     pub fn from_event(ev: &MidiEvent) -> Option<Self> {
         let msg = &ev.message;
-        if msg.kind != MessageKind::NoteOn {
-            return None;
-        }
-        let midi_note = msg.data1?;
-        let velocity = msg.data2.unwrap_or(0);
-        if velocity == 0 {
+        let (event_kind, midi_note, velocity) = match msg.kind {
+            MessageKind::NoteOn if msg.data2.unwrap_or(0) > 0 => {
+                (MappingEventKind::Note, msg.data1?, msg.data2.unwrap_or(0))
+            }
+            MessageKind::ControlChange => (
+                MappingEventKind::ControlChange,
+                msg.data1?,
+                msg.data2.unwrap_or(0),
+            ),
+            _ => return None,
+        };
+        if event_kind == MappingEventKind::Note && velocity == 0 {
             // Note On with zero velocity == Note Off (MIDI convention).
             return None;
         }
         let channel = msg.channel_number().unwrap_or(1);
         Some(Self {
+            event_kind,
             midi_note,
             channel,
             velocity,
@@ -98,6 +108,8 @@ pub struct SetupWizard {
     detected: Option<DetectedHit>,
     /// Additional hits captured near the detected one (possible mistake).
     conflicting: Vec<DetectedHit>,
+    /// A hit matching a component learned earlier in this fresh run.
+    rejected: Option<(DetectedHit, DrumComponent)>,
     /// Accepted mappings, indexed by component order. `None` = skipped/unset.
     accepted: [Option<DrumMapping>; SUPPORTED_COMPONENTS.len()],
     /// Whether each component has been handled (accepted *or* skipped).
@@ -122,6 +134,7 @@ impl SetupWizard {
             index: 0,
             detected: None,
             conflicting: Vec::new(),
+            rejected: None,
             accepted: std::array::from_fn(|_| None),
             handled: [false; SUPPORTED_COMPONENTS.len()],
             suppress_until_micros: 0,
@@ -131,13 +144,19 @@ impl SetupWizard {
 
     /// Starts (or restarts) the wizard from the first component.
     pub fn start(&mut self) {
+        self.start_after(0);
+    }
+
+    /// Starts fresh and rejects every event at or before `boundary_micros`.
+    pub fn start_after(&mut self, boundary_micros: u64) {
         self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[0]);
         self.index = 0;
         self.detected = None;
         self.conflicting.clear();
+        self.rejected = None;
         self.accepted = std::array::from_fn(|_| None);
         self.handled = [false; SUPPORTED_COMPONENTS.len()];
-        self.suppress_until_micros = 0;
+        self.suppress_until_micros = boundary_micros;
         self.finished = false;
     }
 
@@ -146,6 +165,7 @@ impl SetupWizard {
         self.state = SetupWizardState::Canceled;
         self.detected = None;
         self.conflicting.clear();
+        self.rejected = None;
         self.accepted = std::array::from_fn(|_| None);
         self.handled = [false; SUPPORTED_COMPONENTS.len()];
         self.suppress_until_micros = 0;
@@ -172,6 +192,36 @@ impl SetupWizard {
     /// Additional hits that arrived close to the detected one.
     pub fn conflicting_hits(&self) -> &[DetectedHit] {
         &self.conflicting
+    }
+
+    /// Latest hit rejected because it belongs to a component already learned
+    /// in this temporary calibration. Saved/restored mappings are never used.
+    pub fn rejected_hit(&self) -> Option<(DetectedHit, DrumComponent)> {
+        self.rejected
+    }
+
+    /// Establishes a fresh event boundary for the current step.
+    pub fn begin_step_after(&mut self, boundary_micros: u64) {
+        self.suppress_until_micros = boundary_micros;
+        self.detected = None;
+        self.conflicting.clear();
+        self.rejected = None;
+    }
+
+    /// Whether an event is a relevant, post-boundary input for this step.
+    pub fn is_current_step_event(&self, ev: &MidiEvent) -> bool {
+        let Some(hit) = DetectedHit::from_event(ev) else {
+            return false;
+        };
+        let Some(component) = self.current_component() else {
+            return false;
+        };
+        let expected_kind = if component == DrumComponent::HiHatPedalPosition {
+            MappingEventKind::ControlChange
+        } else {
+            MappingEventKind::Note
+        };
+        hit.event_kind == expected_kind && hit.timestamp_micros > self.suppress_until_micros
     }
 
     /// Whether the given component has an accepted mapping so far.
@@ -212,13 +262,33 @@ impl SetupWizard {
         let Some(hit) = DetectedHit::from_event(ev) else {
             return false;
         };
+        let Some(component) = self.current_component() else {
+            return false;
+        };
+        let expected_kind = if component == DrumComponent::HiHatPedalPosition {
+            MappingEventKind::ControlChange
+        } else {
+            MappingEventKind::Note
+        };
+        if hit.event_kind != expected_kind {
+            return false;
+        }
         if hit.timestamp_micros <= self.suppress_until_micros {
             return false;
         }
         match self.state {
             SetupWizardState::Detecting(_) => {
+                if let Some(existing) = self.accepted.iter().flatten().find(|mapping| {
+                    mapping.event_kind == hit.event_kind
+                        && mapping.midi_note == hit.midi_note
+                        && mapping.channel == hit.channel
+                }) {
+                    self.rejected = Some((hit, existing.component));
+                    return false;
+                }
                 self.detected = Some(hit);
                 self.conflicting.clear();
+                self.rejected = None;
                 self.state =
                     SetupWizardState::Confirming(self.current_component().unwrap());
                 true
@@ -254,6 +324,7 @@ impl SetupWizard {
         let component = self.current_component().unwrap();
         self.accepted[self.index] = Some(DrumMapping {
             component,
+            event_kind: hit.event_kind,
             midi_note: hit.midi_note,
             channel: hit.channel,
         });
@@ -271,6 +342,7 @@ impl SetupWizard {
             self.suppress_until_micros = hit.timestamp_micros + HIT_DEBOUNCE_MICROS;
         }
         self.conflicting.clear();
+        self.rejected = None;
         self.state = SetupWizardState::Detecting(self.current_component().unwrap());
     }
 
@@ -284,6 +356,7 @@ impl SetupWizard {
         }
         self.detected = None;
         self.conflicting.clear();
+        self.rejected = None;
         self.handled[self.index] = true;
         self.advance();
     }
@@ -299,6 +372,7 @@ impl SetupWizard {
         self.handled[self.index] = false;
         self.detected = None;
         self.conflicting.clear();
+        self.rejected = None;
         self.suppress_until_micros = 0;
         self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[self.index]);
         true
@@ -323,6 +397,7 @@ impl SetupWizard {
     fn advance(&mut self) {
         self.detected = None;
         self.conflicting.clear();
+        self.rejected = None;
         self.index += 1;
         if self.index >= SUPPORTED_COMPONENTS.len() {
             self.state = SetupWizardState::Completed;
@@ -356,6 +431,19 @@ mod tests {
                 channel: Some(channel),
                 data1: Some(note),
                 data2: Some(velocity),
+                system_exclusive: None,
+            },
+            timestamp_micros: ts,
+        }
+    }
+
+    fn control_change(ts: u64, channel: u8, controller: u8, value: u8) -> MidiEvent {
+        MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::ControlChange,
+                channel: Some(channel),
+                data1: Some(controller),
+                data2: Some(value),
                 system_exclusive: None,
             },
             timestamp_micros: ts,
@@ -456,29 +544,38 @@ mod tests {
     fn completing_setup_builds_configuration() {
         // Notes chosen per component; deliberately NOT the typical GM layout to
         // prove the wizard learns whatever the device sends.
-        let notes = [49u8, 51, 42, 38, 36, 48, 47, 45];
+        let numbers = [49u8, 51, 42, 46, 44, 4, 38, 36, 48, 47, 45];
         let mut w = SetupWizard::new();
         w.start();
 
         let mut ts = 100u64;
         for (i, component) in SUPPORTED_COMPONENTS.iter().enumerate() {
             assert_eq!(w.current_component(), Some(*component));
-            assert!(w.handle_event(&note_on(ts, 9, notes[i], 100 + i as u8)));
+            let event = if *component == DrumComponent::HiHatPedalPosition {
+                control_change(ts, 9, numbers[i], 64)
+            } else {
+                note_on(ts, 9, numbers[i], 100 + i as u8)
+            };
+            assert!(w.handle_event(&event));
             w.accept();
             assert!(w.is_done(*component));
             ts += 100_000;
         }
 
         assert_eq!(w.state(), SetupWizardState::Completed);
-        assert_eq!(w.done_count(), 8);
+        assert_eq!(w.done_count(), SUPPORTED_COMPONENTS.len());
 
         let config = w.finish("NUX DM-1").expect("finish should succeed");
         assert_eq!(config.device_name, "NUX DM-1");
-        assert_eq!(config.mapped_count(), 8);
+        assert_eq!(config.mapped_count(), SUPPORTED_COMPONENTS.len());
         for (i, component) in SUPPORTED_COMPONENTS.iter().enumerate() {
-            assert_eq!(config.note_for(*component), Some(notes[i]));
+            assert_eq!(config.note_for(*component), Some(numbers[i]));
             assert_eq!(config.channel_for(*component), Some(10));
         }
+        assert_eq!(
+            config.get(DrumComponent::HiHatPedalPosition).unwrap().event_kind,
+            MappingEventKind::ControlChange
+        );
     }
 #[test]
     fn skipping_a_component_advances_without_mapping() {
@@ -498,7 +595,7 @@ mod tests {
         assert_eq!(w.done_count(), 1);
 
         // Skip the rest to reach the end.
-        for _ in 0..6 {
+        for _ in 0..SUPPORTED_COMPONENTS.len() - 2 {
             w.skip();
         }
         assert_eq!(w.state(), SetupWizardState::Completed);
@@ -622,5 +719,59 @@ mod tests {
         assert_eq!(hit.channel, 10);
         assert_eq!(hit.velocity, 105);
         assert_eq!(hit.timestamp_micros, 123_456);
+    }
+
+    #[test]
+    fn wizard_order_is_explicit_and_stable() {
+        assert_eq!(
+            SUPPORTED_COMPONENTS,
+            [
+                DrumComponent::Crash,
+                DrumComponent::Ride,
+                DrumComponent::HiHat,
+                DrumComponent::Snare,
+                DrumComponent::Kick,
+                DrumComponent::HiTom,
+                DrumComponent::MidTom,
+                DrumComponent::LowTom,
+                DrumComponent::HiHatOpen,
+                DrumComponent::HiHatPedal,
+                DrumComponent::HiHatPedalPosition,
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_step_boundary_rejects_stale_events() {
+        let mut w = SetupWizard::new();
+        w.start_after(1_000);
+        let stale = note_on(999, 9, 41, 90);
+        let boundary = note_on(1_000, 9, 41, 90);
+        let fresh = note_on(1_001, 9, 55, 90);
+        assert!(!w.is_current_step_event(&stale));
+        assert!(!w.is_current_step_event(&boundary));
+        assert!(w.is_current_step_event(&fresh));
+        assert!(!w.handle_event(&stale));
+        assert!(!w.handle_event(&boundary));
+        assert!(w.detected_hit().is_none());
+        assert!(w.handle_event(&fresh));
+    }
+
+    #[test]
+    fn hit_learned_in_this_run_is_rejected_for_a_later_target() {
+        let mut w = SetupWizard::new();
+        w.start();
+        w.handle_event(&note_on(100, 9, 55, 100));
+        w.accept();
+        assert_eq!(w.current_component(), Some(DrumComponent::Ride));
+
+        assert!(!w.handle_event(&note_on(200_000, 9, 55, 80)));
+        assert_eq!(w.state(), SetupWizardState::Detecting(DrumComponent::Ride));
+        let (hit, component) = w.rejected_hit().expect("wrong hit should be retained");
+        assert_eq!(hit.midi_note, 55);
+        assert_eq!(component, DrumComponent::Crash);
+
+        assert!(w.handle_event(&note_on(300_000, 9, 51, 90)));
+        assert_eq!(w.state(), SetupWizardState::Confirming(DrumComponent::Ride));
     }
 }

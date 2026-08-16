@@ -1,272 +1,392 @@
-//! Setup wizard view (Phase 2).
-//!
-//! A focused flow on top of the Phase 1 UI. The state machine itself lives in
-//! `drums-core` (`SetupWizard` / `SetupWizardState`); this module only renders
-//! it and forwards user decisions. MIDI events are fed to the wizard from
-//! `DrumApp::drain_events` — nothing here touches timing.
+//! Guided, visual setup flow over the core `SetupWizard` state machine.
 
-use drums_core::mapping::{SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS};
+use drums_core::mapping::{DrumComponent, SUPPORTED_COMPONENTS, SetupWizard, SetupWizardState};
 use eframe::egui;
-use egui::RichText;
 
 use crate::{DrumApp, View};
 
-/// Renders the setup wizard tab into the supplied `Ui`.
-///
-/// `main.rs` calls this as `wizard_ui::show(self, ui)`; it is a thin
-/// presentation layer over the existing `SetupWizard` state machine and
-/// `MappingStore` persistence, owning no logic of its own.
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-
-        if !app.connected {
-            intro_prompt(ui);
-            return;
+    if !app.connected {
+        ui.heading("SETUP WIZARD");
+        ui.label("Connect a MIDI input device to begin.");
+        return;
+    }
+    let device = app
+        .backend
+        .connected_port_name()
+        .unwrap_or("MIDI device")
+        .to_string();
+    if app.wizard.is_none() {
+        ui.heading("SETUP WIZARD");
+        ui.label(format!("Connected device: {device}"));
+        ui.label("The wizard will ask you to hit each playable drum or hi-hat state.");
+        ui.add_space(16.0);
+        if ui
+            .add_sized([180.0, 40.0], egui::Button::new("Start Setup"))
+            .clicked()
+        {
+            let mut wizard = SetupWizard::new();
+            wizard.start_after(app.clock.now_micros());
+            app.wizard = Some(wizard);
+            app.wizard_device = Some(device);
+            app.wizard_last_input = None;
         }
-
-        let device = app
-            .backend
-            .connected_port_name()
-            .unwrap_or("unknown device")
-            .to_string();
-
-        // No wizard running: show the intro screen with a Start button.
-        if app.wizard.is_none() {
-            intro_screen(ui, &device);
-            if ui.button("Start Setup").clicked() {
-                let mut wizard = SetupWizard::new();
-                wizard.start();
-                app.wizard = Some(wizard);
-                app.wizard_device = Some(device.clone());
-            }
-            ui.add_space(4.0);
-            if ui.button("Back to Monitor").clicked() {
-                app.view = View::Monitor;
-            }
-            return;
-        }
-
-        // Wizard active: collect the clicked action while `wizard` is
-        // borrowed, then apply it afterwards so finishing/cancelling can
-        // replace or drop the wizard itself without a borrow conflict.
-        enum Action {
-            None,
-            Accept,
-            Retry,
-            Skip,
-            Back,
-            Cancel,
-            Finish,
-        }
-        let mut action = Action::None;
-
-                {
-            let wizard = app.wizard.as_mut().expect("checked above");
-
-            progress_header(ui, wizard, &device);
-            ui.add_space(6.0);
-            ui.separator();
-
-            match wizard.state() {
-                SetupWizardState::Detecting(component) => {
-                    ui.add_space(8.0);
-                    ui.heading(RichText::new(component.label()).size(28.0));
-                    ui.label(format!("Hit your {} once.", component.label()));
-                    ui.weak("Waiting for the next MIDI Note-On (velocity > 0)…");
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if wizard.can_go_back() && ui.button("‹ Back").clicked() {
-                            action = Action::Back;
-                        }
-                        if ui.button("Skip").clicked() {
-                            action = Action::Skip;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Action::Cancel;
-                        }
-                    });
-                }
-                SetupWizardState::Confirming(component) => {
-                    ui.add_space(8.0);
-                    ui.heading(RichText::new(component.label()).size(28.0));
-                    if let Some(hit) = wizard.detected_hit() {
-                        egui::Grid::new("wizard_hit_grid")
-                            .num_columns(2)
-                            .spacing([24.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.label("MIDI Note");
-                                ui.monospace(hit.midi_note.to_string());
-                                ui.end_row();
-                                ui.label("Velocity");
-                                ui.monospace(hit.velocity.to_string());
-                                ui.end_row();
-                                ui.label("MIDI channel");
-                                ui.monospace(hit.channel.to_string());
-                                ui.end_row();
-                                ui.label("Timestamp");
-                                ui.monospace(format!("{} µs", hit.timestamp_micros));
-                                ui.end_row();
-                            });
-                    }
-
-                    if !wizard.conflicting_hits().is_empty() {
-                        let extra: Vec<String> = wizard
-                            .conflicting_hits()
-                            .iter()
-                            .map(|h| h.midi_note.to_string())
-                            .collect();
-                        ui.colored_label(
-                            egui::Color32::from_rgb(240, 200, 80),
-                            format!(
-                                "⚠ Multiple notes arrived together ({}) — only the first is \
-                                 staged. Press Retry if this is wrong.",
-                                extra.join(", ")
-                            ),
-                        );
-                    }
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("✔ Accept").size(16.0)))
-                            .clicked()
-                        {
-                            action = Action::Accept;
-                        }
-                        if ui
-                            .add(egui::Button::new(RichText::new("↺ Retry").size(16.0)))
-                            .clicked()
-                        {
-                            action = Action::Retry;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if wizard.can_go_back() && ui.button("‹ Back").clicked() {
-                            action = Action::Back;
-                        }
-                        if ui.button("Skip").clicked() {
-                            action = Action::Skip;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Action::Cancel;
-                        }
-                    });
-                }
-                SetupWizardState::Completed => {
-                    ui.add_space(8.0);
-                    ui.heading(RichText::new("SETUP COMPLETE ✓").size(22.0));
-                    ui.label(format!(
-                        "{}/{} components configured for “{}”.",
-                        wizard.done_count(),
-                        SUPPORTED_COMPONENTS.len(),
-                        device
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("💾 Finish & Save mapping").size(16.0),
-                            ))
-                            .clicked()
-                        {
-                            action = Action::Finish;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Action::Cancel;
-                        }
-                    });
-                }
-                SetupWizardState::Intro | SetupWizardState::Canceled => {
-                    // Transient states inside an active wizard are impossible in
-                    // normal flow; show a hint rather than nothing.
-                    ui.weak("Setup is not running. Press “Start Setup” to begin.");
-                }
-            }
-        }
-
-        match action {
-                        Action::Accept => {
-                if let Some(wizard) = app.wizard.as_mut() {
-                    wizard.accept();
-                }
-            }
-            Action::Retry => {
-                if let Some(wizard) = app.wizard.as_mut() {
-                    wizard.retry();
-                }
-            }
-            Action::Skip => {
-                if let Some(wizard) = app.wizard.as_mut() {
-                    wizard.skip();
-                }
-            }
-            Action::Back => {
-                if let Some(wizard) = app.wizard.as_mut() {
-                    wizard.back();
-                }
-            }
-            Action::Cancel => {
-                app.wizard = None;
-                app.wizard_device = None;
-                app.view = View::Monitor;
-            }
-                        Action::Finish => finish_wizard(app, &device),
-            Action::None => {}
-        }
+        return;
     }
 
-/// Shown when no MIDI device is connected.
-fn intro_prompt(ui: &mut egui::Ui) {
-    ui.heading("SET UP YOUR DRUM KIT");
-    ui.separator();
-    ui.label("Connect a MIDI input device first.");
-    ui.weak("The wizard learns the mapping by listening for real hits on the connected kit.");
-}
-
-/// The intro screen shown once a device is connected but no wizard is running.
-fn intro_screen(ui: &mut egui::Ui, _device: &str) {
-    ui.heading("SET UP YOUR DRUM KIT");
-    ui.separator();
-    ui.label(
-        "We will identify each component of your electronic drum kit.\n\
-         Hit each component when asked.",
-    );
-    ui.add_space(14.0);
-}
-
-/// Shared progress header: how many components are done so far.
-fn progress_header(ui: &mut egui::Ui, wizard: &SetupWizard, device: &str) {
-    ui.colored_label(
-        egui::Color32::from_rgb(140, 160, 220),
-        format!(
-            "Configuring: \u{201c}{}\u{201d}  -  {}/{} components done",
-            device,
-            wizard.done_count(),
-            SUPPORTED_COMPONENTS.len(),
-        ),
-    );
-        ui.add_space(4.0);
-    ui.separator();
-}
-
-/// Finalises the wizard: produces the configuration, saves it to the
-/// `MappingStore`, and returns to the Monitor view.
-fn finish_wizard(app: &mut DrumApp, device: &str) {
-    let config = app.wizard.as_mut().and_then(|w| w.finish(device));
-    if let Some(cfg) = config {
-        if let Err(e) = app.store.save(&cfg) {
-            app.status = format!("Failed to save mapping: {e}");
-        } else {
-            app.status = format!(
-                "Mapping saved for \u{201c}{}\u{201d}: {}/{} drums configured.",
-                cfg.device_name,
-                cfg.mapped_count(),
-                SUPPORTED_COMPONENTS.len(),
-            );
+    enum Action {
+        None,
+        Accept,
+        Retry,
+        Skip,
+        Back,
+        Cancel,
+        Finish,
+    }
+    let mut action = Action::None;
+    let latest = app.wizard_last_input.clone();
+    let interpreted = app.wizard.as_ref().and_then(|wizard| {
+        wizard
+            .rejected_hit()
+            .map(|(_, component)| component)
+            .or_else(|| wizard.detected_hit().and(wizard.current_component()))
+    });
+    {
+        let wizard = app.wizard.as_ref().expect("checked above");
+        ui.heading("SETUP WIZARD");
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!(
+                "Step {} of {}",
+                current_step(wizard),
+                SUPPORTED_COMPONENTS.len()
+            ));
+            ui.separator();
+            ui.label(format!("Connected device: {device}"));
+        });
+        ui.add_space(10.0);
+        ui.columns(2, |columns| {
+            columns[0].set_min_width(210.0);
+            progress_list(&mut columns[0], wizard);
+            columns[1].set_min_width(420.0);
+            match wizard.state() {
+                SetupWizardState::Detecting(component) => {
+                    component_prompt(&mut columns[1], component, false);
+                    columns[1].label(format!("Hit the {} on your kit.", component.label()));
+                    if component == DrumComponent::HiHatPedalPosition {
+                        columns[1].weak(
+                            "This optional MIDI control is supported by some electronic drum kits. If your kit does not provide pedal-position data, choose Skip.",
+                        );
+                    } else if matches!(component, DrumComponent::HiHatOpen | DrumComponent::HiHatPedal) {
+                        columns[1].weak(
+                            "If your kit does not send a distinct MIDI note for this state, choose Skip.",
+                        );
+                    }
+                    columns[1].add_space(8.0);
+                    if let Some((hit, detected)) = wizard.rejected_hit() {
+                        columns[1].colored_label(
+                            egui::Color32::from_rgb(245, 105, 100),
+                            format!(
+                                "Wrong input - expected {}, detected {}",
+                                component.label(),
+                                detected.label()
+                            ),
+                        );
+                        columns[1].monospace(format!(
+                            "Note {} | Channel {} | Velocity {}",
+                            hit.midi_note, hit.channel, hit.velocity
+                        ));
+                    }
+                    columns[1].spinner();
+                    columns[1].strong("Waiting for new MIDI input...");
+                }
+                SetupWizardState::Confirming(component) => {
+                    component_prompt(&mut columns[1], component, true);
+                    columns[1].colored_label(
+                        egui::Color32::from_rgb(90, 220, 140),
+                        "New MIDI input captured - confirm this mapping",
+                    );
+                    if let Some(hit) = wizard.detected_hit() {
+                        columns[1].monospace(format!(
+                            "{} {} | Channel {} | {} {}",
+                            hit.event_kind.label(),
+                            hit.midi_note,
+                            hit.channel,
+                            if hit.event_kind == drums_core::mapping::MappingEventKind::Note { "Velocity" } else { "Value" },
+                            hit.velocity
+                        ));
+                    }
+                }
+                SetupWizardState::Completed => {
+                    columns[1].heading("SETUP COMPLETE");
+                    columns[1].label(format!("{} / {} components configured", wizard.done_count(), SUPPORTED_COMPONENTS.len()));
+                    columns[1].label(format!("Connected device: {device}"));
+                }
+                SetupWizardState::Intro | SetupWizardState::Canceled => {}
+            }
+        });
+        wizard_target_circles(ui, wizard.current_component());
+        ui.add_space(12.0);
+        last_input_panel(ui, latest.as_ref(), interpreted);
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| match wizard.state() {
+            SetupWizardState::Detecting(_) => {
+                if wizard.can_go_back() && big_button(ui, "Back") {
+                    action = Action::Back;
+                }
+                if big_button(ui, "Skip") {
+                    action = Action::Skip;
+                }
+                if big_button(ui, "Cancel") {
+                    action = Action::Cancel;
+                }
+            }
+            SetupWizardState::Confirming(_) => {
+                if big_button_enabled(ui, "Accept / Continue", true) {
+                    action = Action::Accept;
+                }
+                if big_button(ui, "Reassign / Retry") {
+                    action = Action::Retry;
+                }
+                if wizard.can_go_back() && big_button(ui, "Back") {
+                    action = Action::Back;
+                }
+                if big_button(ui, "Skip") {
+                    action = Action::Skip;
+                }
+                if big_button(ui, "Cancel") {
+                    action = Action::Cancel;
+                }
+            }
+            SetupWizardState::Completed => {
+                if big_button(ui, "Done - Save Mapping") {
+                    action = Action::Finish;
+                }
+                if big_button(ui, "Cancel") {
+                    action = Action::Cancel;
+                }
+            }
+            _ => {}
+        });
+    }
+    match action {
+        Action::Accept => {
+            app.wizard.as_mut().unwrap().accept();
+            let boundary = app.clock.now_micros();
+            app.wizard.as_mut().unwrap().begin_step_after(boundary);
+            app.wizard_last_input = None;
         }
-        app.active_config = Some(cfg);
+        Action::Retry => {
+            app.wizard.as_mut().unwrap().retry();
+            let boundary = app.clock.now_micros();
+            app.wizard.as_mut().unwrap().begin_step_after(boundary);
+            app.wizard_last_input = None;
+        }
+        Action::Skip => {
+            app.wizard.as_mut().unwrap().skip();
+            let boundary = app.clock.now_micros();
+            app.wizard.as_mut().unwrap().begin_step_after(boundary);
+            app.wizard_last_input = None;
+        }
+        Action::Back => {
+            app.wizard.as_mut().unwrap().back();
+            let boundary = app.clock.now_micros();
+            app.wizard.as_mut().unwrap().begin_step_after(boundary);
+            app.wizard_last_input = None;
+        }
+        Action::Cancel => {
+            app.wizard = None;
+            app.wizard_device = None;
+            app.wizard_last_input = None;
+            app.view = View::Monitor;
+        }
+        Action::Finish => finish_wizard(app, &device),
+        Action::None => {}
+    }
+}
+
+fn current_step(wizard: &SetupWizard) -> usize {
+    wizard
+        .current_component()
+        .and_then(|current| {
+            SUPPORTED_COMPONENTS
+                .iter()
+                .position(|value| *value == current)
+        })
+        .map(|index| index + 1)
+        .unwrap_or(SUPPORTED_COMPONENTS.len())
+}
+
+fn progress_list(ui: &mut egui::Ui, wizard: &SetupWizard) {
+    egui::Frame::group(ui.style())
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.strong("PROGRESS");
+            for component in SUPPORTED_COMPONENTS {
+                let prefix = if wizard.is_done(component) {
+                    "DONE"
+                } else if wizard.current_component() == Some(component) {
+                    "CURRENT"
+                } else {
+                    "PENDING"
+                };
+                let color = if wizard.current_component() == Some(component) {
+                    egui::Color32::from_rgb(120, 205, 255)
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.colored_label(color, format!("{prefix}  {}", component.label()));
+            }
+        });
+}
+
+fn component_prompt(ui: &mut egui::Ui, component: DrumComponent, _active: bool) {
+    ui.weak("CONFIGURE");
+    ui.heading(egui::RichText::new(component.label()).size(30.0));
+}
+
+fn last_input_panel(
+    ui: &mut egui::Ui,
+    event: Option<&drums_core::MidiEvent>,
+    interpreted: Option<DrumComponent>,
+) {
+    egui::Frame::group(ui.style())
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.strong("LAST DETECTED INPUT");
+            let Some(event) = event else {
+                ui.weak("Waiting for MIDI input...");
+                return;
+            };
+            ui.label(
+                egui::RichText::new(interpreted.map(DrumComponent::label).unwrap_or("UNKNOWN"))
+                    .strong()
+                    .size(21.0),
+            );
+            let kind = if event.message.kind == drums_core::MessageKind::ControlChange {
+                "CC"
+            } else {
+                "Note"
+            };
+            let number = event
+                .message
+                .data1
+                .map_or_else(|| "N/A".into(), |value| value.to_string());
+            let value = event
+                .message
+                .data2
+                .map_or_else(|| "N/A".into(), |value| value.to_string());
+            let channel = event
+                .message
+                .channel_number()
+                .map_or_else(|| "N/A".into(), |value| value.to_string());
+            ui.monospace(format!(
+                "Type: {kind} | {kind}: {number} | Channel: {channel} | Value: {value}"
+            ));
+            if event.message.kind == drums_core::MessageKind::ControlChange {
+                ui.add(
+                    egui::ProgressBar::new(event.message.data2.unwrap_or(0) as f32 / 127.0).text(
+                        format!("Pedal position: {} / 127", event.message.data2.unwrap_or(0)),
+                    ),
+                );
+            }
+        });
+}
+
+fn wizard_target_circles(ui: &mut egui::Ui, target: Option<DrumComponent>) {
+    ui.add_space(10.0);
+    ui.strong("DRUM KIT");
+    const ORDER: [DrumComponent; 8] = [
+        DrumComponent::Crash,
+        DrumComponent::Ride,
+        DrumComponent::HiHat,
+        DrumComponent::Snare,
+        DrumComponent::Kick,
+        DrumComponent::HiTom,
+        DrumComponent::MidTom,
+        DrumComponent::LowTom,
+    ];
+    let cell_width = 104.0;
+    let columns = (ui.available_width() / cell_width).floor().max(1.0) as usize;
+    for row in ORDER.chunks(columns) {
+        ui.horizontal_top(|ui| {
+            for component in row {
+                ui.push_id(("wizard_target", component), |ui| {
+                    let (response, painter) =
+                        ui.allocate_painter(egui::vec2(96.0, 72.0), egui::Sense::hover());
+                    let active = target.is_some_and(|value| {
+                        value == *component
+                            || (*component == DrumComponent::HiHat
+                                && matches!(
+                                    value,
+                                    DrumComponent::HiHatOpen
+                                        | DrumComponent::HiHatPedal
+                                        | DrumComponent::HiHatPedalPosition
+                                ))
+                    });
+                    let center = response.rect.center_top() + egui::vec2(0.0, 27.0);
+                    let fill = if active {
+                        egui::Color32::from_rgb(80, 205, 245)
+                    } else {
+                        egui::Color32::from_rgb(65, 78, 96)
+                    };
+                    painter.circle_filled(center, 22.0, fill);
+                    painter.circle_stroke(
+                        center,
+                        22.0,
+                        egui::Stroke::new(
+                            if active { 4.0_f32 } else { 2.0_f32 },
+                            if active {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::from_gray(125)
+                            },
+                        ),
+                    );
+                    painter.text(
+                        response.rect.center_bottom() - egui::vec2(0.0, 3.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        component.instrument_label(),
+                        egui::FontId::proportional(12.0),
+                        if active {
+                            egui::Color32::from_rgb(120, 220, 255)
+                        } else {
+                            ui.visuals().text_color()
+                        },
+                    );
+                });
+            }
+        });
+    }
+}
+
+fn big_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add_sized([150.0, 40.0], egui::Button::new(label))
+        .clicked()
+}
+
+fn big_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label).min_size(egui::vec2(150.0, 40.0)),
+    )
+    .clicked()
+}
+
+fn finish_wizard(app: &mut DrumApp, device: &str) {
+    if let Some(config) = app.wizard.as_mut().and_then(|wizard| wizard.finish(device)) {
+        match app.store.save(&config) {
+            Ok(()) => {
+                app.status = format!(
+                    "Mapping saved for {device}: {} components configured.",
+                    config.mapped_count()
+                );
+                app.active_config = Some(config);
+            }
+            Err(error) => app.status = format!("Failed to save mapping: {error}"),
+        }
     }
     app.wizard = None;
     app.wizard_device = None;
+    app.wizard_last_input = None;
     app.view = View::Monitor;
 }

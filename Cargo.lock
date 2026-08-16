@@ -1033,6 +1033,8 @@ dependencies = [
  "eframe",
  "rfd",
  "rodio",
+ "serde",
+ "toml",
 ]
 
 [[package]]

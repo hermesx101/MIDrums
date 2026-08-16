@@ -20,7 +20,7 @@ pub use wizard::{DetectedHit, SetupWizard, SetupWizardState};
 
 /// The drum components supported by the initial setup wizard, in the order the
 /// wizard walks through them.
-pub const SUPPORTED_COMPONENTS: [DrumComponent; 8] = [
+pub const SUPPORTED_COMPONENTS: [DrumComponent; 11] = [
     DrumComponent::Crash,
     DrumComponent::Ride,
     DrumComponent::HiHat,
@@ -29,6 +29,9 @@ pub const SUPPORTED_COMPONENTS: [DrumComponent; 8] = [
     DrumComponent::HiTom,
     DrumComponent::MidTom,
     DrumComponent::LowTom,
+    DrumComponent::HiHatOpen,
+    DrumComponent::HiHatPedal,
+    DrumComponent::HiHatPedalPosition,
 ];
 
 /// A physical drum component of a kit.
@@ -37,6 +40,9 @@ pub enum DrumComponent {
     Crash,
     Ride,
     HiHat,
+    HiHatOpen,
+    HiHatPedal,
+    HiHatPedalPosition,
     Snare,
     Kick,
     HiTom,
@@ -46,19 +52,57 @@ pub enum DrumComponent {
 
 impl DrumComponent {
     /// All supported components, in wizard order.
-    pub const ALL: [DrumComponent; 8] = SUPPORTED_COMPONENTS;
+    pub const ALL: [DrumComponent; 10] = [
+        DrumComponent::Crash,
+        DrumComponent::Ride,
+        DrumComponent::HiHat,
+        DrumComponent::HiHatOpen,
+        DrumComponent::HiHatPedal,
+        DrumComponent::Snare,
+        DrumComponent::Kick,
+        DrumComponent::HiTom,
+        DrumComponent::MidTom,
+        DrumComponent::LowTom,
+    ];
 
     /// Short, all-caps label used in grids and prompts (e.g. `"HI-HAT"`).
     pub fn label(self) -> &'static str {
         match self {
             DrumComponent::Crash => "CRASH",
             DrumComponent::Ride => "RIDE",
-            DrumComponent::HiHat => "HI-HAT",
+            DrumComponent::HiHat => "HI-HAT CLOSED",
+            DrumComponent::HiHatOpen => "HI-HAT OPEN",
+            DrumComponent::HiHatPedal => "HI-HAT PEDAL",
+            DrumComponent::HiHatPedalPosition => "HI-HAT PEDAL POSITION",
             DrumComponent::Snare => "SNARE",
             DrumComponent::Kick => "KICK",
             DrumComponent::HiTom => "HI TOM",
             DrumComponent::MidTom => "MID TOM",
             DrumComponent::LowTom => "LOW TOM",
+        }
+    }
+
+    /// Physical instrument name, shared by playable hi-hat states.
+    pub fn instrument_label(self) -> &'static str {
+        match self {
+            DrumComponent::HiHat
+            | DrumComponent::HiHatOpen
+            | DrumComponent::HiHatPedal
+            | DrumComponent::HiHatPedalPosition => {
+                "HI-HAT"
+            }
+            _ => self.label(),
+        }
+    }
+
+    /// Optional playable state within a physical instrument.
+    pub fn state_label(self) -> Option<&'static str> {
+        match self {
+            DrumComponent::HiHat => Some("Closed"),
+            DrumComponent::HiHatOpen => Some("Open"),
+            DrumComponent::HiHatPedal => Some("Pedal"),
+            DrumComponent::HiHatPedalPosition => Some("Pedal Position"),
+            _ => None,
         }
     }
 
@@ -68,6 +112,9 @@ impl DrumComponent {
             DrumComponent::Crash => "Crash",
             DrumComponent::Ride => "Ride",
             DrumComponent::HiHat => "Hi-Hat",
+            DrumComponent::HiHatOpen => "Hi-Hat Open",
+            DrumComponent::HiHatPedal => "Hi-Hat Pedal",
+            DrumComponent::HiHatPedalPosition => "Hi-Hat Pedal Position",
             DrumComponent::Snare => "Snare",
             DrumComponent::Kick => "Kick",
             DrumComponent::HiTom => "Hi Tom",
@@ -82,6 +129,9 @@ impl DrumComponent {
             "Crash" => Some(DrumComponent::Crash),
             "Ride" => Some(DrumComponent::Ride),
             "Hi-Hat" => Some(DrumComponent::HiHat),
+            "Hi-Hat Open" => Some(DrumComponent::HiHatOpen),
+            "Hi-Hat Pedal" => Some(DrumComponent::HiHatPedal),
+            "Hi-Hat Pedal Position" => Some(DrumComponent::HiHatPedalPosition),
             "Snare" => Some(DrumComponent::Snare),
             "Kick" => Some(DrumComponent::Kick),
             "Hi Tom" => Some(DrumComponent::HiTom),
@@ -117,10 +167,28 @@ impl<'de> Deserialize<'de> for DrumComponent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrumMapping {
     pub component: DrumComponent,
+    #[serde(default)]
+    pub event_kind: MappingEventKind,
     /// MIDI note number 0..=127, learned from the device or typed manually.
     pub midi_note: u8,
     /// MIDI channel as displayed to the user, 1..=16.
     pub channel: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MappingEventKind {
+    #[default]
+    Note,
+    ControlChange,
+}
+
+impl MappingEventKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::ControlChange => "CC",
+        }
+    }
 }
 
 /// An ordered set of drum-mapping entries for one MIDI device.
@@ -187,5 +255,57 @@ impl DrumKitConfiguration {
     /// Returns `true` when no drums are configured.
     pub fn is_empty(&self) -> bool {
         self.mappings.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod phase5e_tests {
+    use super::*;
+
+    #[test]
+    fn closed_open_and_pedal_hi_hat_mappings_coexist_and_remain_compatible() {
+        let mut config = DrumKitConfiguration::new("kit");
+        for (component, midi_note) in [
+            (DrumComponent::HiHat, 42),
+            (DrumComponent::HiHatOpen, 46),
+            (DrumComponent::HiHatPedal, 44),
+        ] {
+            config.set(DrumMapping {
+                component,
+                event_kind: MappingEventKind::Note,
+                midi_note,
+                channel: 10,
+            });
+        }
+        config.set(DrumMapping {
+            component: DrumComponent::HiHatPedalPosition,
+            event_kind: MappingEventKind::ControlChange,
+            midi_note: 4,
+            channel: 10,
+        });
+        assert_eq!(config.note_for(DrumComponent::HiHat), Some(42));
+        assert_eq!(config.note_for(DrumComponent::HiHatOpen), Some(46));
+        assert_eq!(config.note_for(DrumComponent::HiHatPedal), Some(44));
+        assert_eq!(
+            config.get(DrumComponent::HiHatPedalPosition).unwrap().event_kind,
+            MappingEventKind::ControlChange
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: DrumKitConfiguration = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, config);
+        assert_eq!(DrumComponent::from_str("Hi-Hat"), Some(DrumComponent::HiHat));
+    }
+
+    #[test]
+    fn legacy_mapping_without_event_kind_defaults_to_note() {
+        let legacy = r#"
+device_name = "NUX"
+[[mappings]]
+component = "Snare"
+midi_note = 38
+channel = 10
+"#;
+        let config: DrumKitConfiguration = toml::from_str(legacy).unwrap();
+        assert_eq!(config.mappings[0].event_kind, MappingEventKind::Note);
     }
 }

@@ -18,19 +18,21 @@
 mod click_audio;
 mod mapping_ui;
 mod midi_file_ui;
+mod track_library;
 mod wizard_ui;
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
+use drums_core::mapping::{DrumKitConfiguration, MappingStore, SUPPORTED_COMPONENTS, SetupWizard};
 use drums_core::time::{SharedClock, SystemClock};
 use drums_core::{
-    suggest_subdivision, ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile,
-    MusicalTransport, PortInfo, PracticeResult, PracticeSession, Subdivision,
-    SubdivisionSuggestion, Timeline,
+    ActualHit, MatchingConfig, Metronome, MidiBackend, MidiEvent, MidiFile, MusicalTransport,
+    PortInfo, PracticeResult, PracticeSession, Subdivision, SubdivisionSuggestion, Timeline,
+    suggest_subdivision,
 };
 use eframe::egui;
+use track_library::{LibraryEntry, LibrarySort};
 
 /// Top-level views the app can show.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,15 +41,49 @@ enum View {
     Monitor,
     /// Phase 2 setup wizard.
     Setup,
-    MidiInspection,
+    Mapping,
+    TrackLibrary,
+    Practice,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PracticeLoopMode {
+    Off,
+    CurrentBar,
+    TwoBars,
+    FourBars,
+    EightBars,
+    Custom,
+}
+
+impl PracticeLoopMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::CurrentBar => "Current Bar",
+            Self::TwoBars => "2 Bars",
+            Self::FourBars => "4 Bars",
+            Self::EightBars => "8 Bars",
+            Self::Custom => "Custom",
+        }
+    }
+    fn bars(self) -> Option<u64> {
+        match self {
+            Self::CurrentBar => Some(1),
+            Self::TwoBars => Some(2),
+            Self::FourBars => Some(4),
+            Self::EightBars => Some(8),
+            _ => None,
+        }
+    }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 640.0])
+            .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 420.0])
-            .with_title("MIDI Drum Practice — Phase 2"),
+            .with_title("MIDI Drum Practice - Phase 5A"),
         ..Default::default()
     };
     eframe::run_native(
@@ -76,8 +112,17 @@ struct DrumApp {
     wizard: Option<SetupWizard>,
     /// Name of the device the running wizard was started against.
     wizard_device: Option<String>,
+    wizard_last_input: Option<MidiEvent>,
     /// Working copy edited in the manual mapping view.
     mapping_draft: Option<DrumKitConfiguration>,
+    mapping_assign_component: drums_core::DrumComponent,
+    mapping_reassign_component: Option<drums_core::DrumComponent>,
+    mapping_reassign_after_micros: u64,
+    mapping_reassign_candidate: Option<MidiEvent>,
+    mapping_reassign_started: Option<Instant>,
+    /// Last meaningful hit shown by Drum Mapping; Note Off never replaces it.
+    mapping_last_input: Option<MidiEvent>,
+    mapping_last_detected_component: Option<drums_core::DrumComponent>,
     /// Currently selected view/tab.
     view: View,
     imported_midi: Option<MidiFile>,
@@ -95,6 +140,27 @@ struct DrumApp {
     subdivision_auto: bool,
     subdivision_suggestion: Option<SubdivisionSuggestion>,
     metronome_enabled: bool,
+    /// UI-only future window for the Phase 5A rhythm chart.
+    practice_lookahead_seconds: f64,
+    practice_loop_mode: PracticeLoopMode,
+    practice_loop_start_tick: u64,
+    practice_loop_end_tick: u64,
+    practice_loop_start_bar: u64,
+    practice_loop_end_bar: u64,
+    practice_loop_iteration: u64,
+    count_in_bars: u8,
+    count_in_active: bool,
+    count_in_end_tick: u64,
+    count_in_target_tick: u64,
+    track_library: Vec<LibraryEntry>,
+    library_search: String,
+    library_sort: LibrarySort,
+    library_rename_path: Option<String>,
+    library_rename_buffer: String,
+    library_remove_path: Option<String>,
+    current_library_path: Option<String>,
+    library_selected_path: Option<String>,
+    completion_saved: bool,
     click_audio: click_audio::ClickAudio,
 }
 
@@ -133,8 +199,16 @@ impl DrumApp {
             active_config: None,
             wizard: None,
             wizard_device: None,
+            wizard_last_input: None,
             mapping_draft: None,
-            view: View::Monitor,
+            mapping_assign_component: drums_core::DrumComponent::HiHatPedal,
+            mapping_reassign_component: None,
+            mapping_reassign_after_micros: 0,
+            mapping_reassign_candidate: None,
+            mapping_reassign_started: None,
+            mapping_last_input: None,
+            mapping_last_detected_component: None,
+            view: View::TrackLibrary,
             imported_midi: None,
             selected_drum_track: None,
             midi_import_error: None,
@@ -150,6 +224,26 @@ impl DrumApp {
             subdivision_auto: true,
             subdivision_suggestion: None,
             metronome_enabled: false,
+            practice_lookahead_seconds: 4.0,
+            practice_loop_mode: PracticeLoopMode::Off,
+            practice_loop_start_tick: 0,
+            practice_loop_end_tick: 0,
+            practice_loop_start_bar: 1,
+            practice_loop_end_bar: 2,
+            practice_loop_iteration: 1,
+            count_in_bars: 0,
+            count_in_active: false,
+            count_in_end_tick: 0,
+            count_in_target_tick: 0,
+            track_library: track_library::load(),
+            library_search: String::new(),
+            library_sort: LibrarySort::RecentlyAdded,
+            library_rename_path: None,
+            library_rename_buffer: String::new(),
+            library_remove_path: None,
+            current_library_path: None,
+            library_selected_path: None,
+            completion_saved: false,
             click_audio: click_audio::ClickAudio::new(),
         }
     }
@@ -162,12 +256,45 @@ impl DrumApp {
         // handles Note On/Off filtering and confirmation itself.
         if self.wizard.is_some() {
             for ev in &new_events {
+                if self
+                    .wizard
+                    .as_ref()
+                    .is_some_and(|wizard| wizard.is_current_step_event(ev))
+                {
+                    self.wizard_last_input = Some(ev.clone());
+                }
                 if let Some(wizard) = self.wizard.as_mut() {
                     wizard.handle_event(ev);
                 }
             }
         }
         for ev in new_events {
+            if (ev.message.kind == drums_core::MessageKind::NoteOn
+                && ev.message.velocity().unwrap_or(0) > 0)
+                || ev.message.kind == drums_core::MessageKind::ControlChange
+            {
+                self.mapping_last_input = Some(ev.clone());
+                self.mapping_last_detected_component = self.active_config.as_ref().and_then(|config| {
+                    let channel = ev.message.channel_number()?;
+                    let (kind, number) = match ev.message.kind {
+                        drums_core::MessageKind::NoteOn => (
+                            drums_core::mapping::MappingEventKind::Note,
+                            ev.message.note()?,
+                        ),
+                        drums_core::MessageKind::ControlChange => (
+                            drums_core::mapping::MappingEventKind::ControlChange,
+                            ev.message.data1?,
+                        ),
+                        _ => return None,
+                    };
+                    config.mappings.iter().find_map(|mapping| {
+                        (mapping.event_kind == kind
+                            && mapping.midi_note == number
+                            && mapping.channel == channel)
+                            .then_some(mapping.component)
+                    })
+                });
+            }
             if let (Some(config), Some(transport)) = (&self.active_config, &self.transport) {
                 if let Some(hit) = ActualHit::from_midi_event_observed_at(
                     &ev,
@@ -176,7 +303,7 @@ impl DrumApp {
                     observed_at_micros,
                 ) {
                     self.last_live_hit = Some(hit.clone());
-                    if transport.is_playing() {
+                    if transport.is_playing() && !self.count_in_active {
                         if let Some(session) = self.practice_session.as_mut() {
                             session.record_hit(hit, transport);
                         }
@@ -208,19 +335,24 @@ impl DrumApp {
                 self.events.clear();
                 // Restore a previously saved mapping for this device, so the
                 // same kit reconnects to the configuration the user built.
-                let stored = self.store.load(&name).unwrap_or(None);
+                let stored = self
+                    .store
+                    .load(&name)
+                    .unwrap_or(None)
+                    .filter(|config| !config.is_empty());
                 self.active_config = stored.clone();
                 self.mapping_draft = None;
                 self.status = match &stored {
                     Some(cfg) => format!(
-                        "Connected to “{name}”. Restored mapping: {} of {} drums configured.",
+                        "Connected to {name}. Restored mapping: {} of {} drums configured.",
                         cfg.mapped_count(),
                         SUPPORTED_COMPONENTS.len()
                     ),
-                    None => format!(
-                        "Connected to “{name}”. No saved mapping yet — run the Setup Wizard."
-                    ),
+                    None => {
+                        format!("Connected to {name}. No saved mapping yet - run the Setup Wizard.")
+                    }
                 };
+                self.view = View::TrackLibrary;
             }
             Err(e) => {
                 self.connected = false;
@@ -236,7 +368,10 @@ impl DrumApp {
         self.active_config = None;
         self.wizard = None;
         self.wizard_device = None;
+        self.wizard_last_input = None;
         self.mapping_draft = None;
+        self.mapping_last_input = None;
+        self.mapping_last_detected_component = None;
         self.last_live_hit = None;
         self.status = "Disconnected.".to_string();
     }
@@ -251,18 +386,36 @@ impl DrumApp {
         };
         match MidiFile::from_path(&path) {
             Ok(file) => {
-                self.selected_drum_track = file.suggested_drum_track();
-                self.transport = Some(MusicalTransport::from_midi_file(&file));
-                self.imported_midi = Some(file);
-                self.rebuild_timeline();
-                self.metronome.reset();
+                let library_path = path.to_string_lossy().into_owned();
+                if !self
+                    .track_library
+                    .iter()
+                    .any(|entry| entry.path == library_path)
+                {
+                    self.track_library.push(LibraryEntry {
+                        path: library_path,
+                        display_name: file.filename.clone(),
+                        bpm: file.tempo_events.first().map(|tempo| tempo.bpm()),
+                        time_signature: file
+                            .time_signature_events
+                            .first()
+                            .map(|value| format!("{}/{}", value.numerator, value.denominator())),
+                        duration_seconds: file.duration_seconds,
+                        note_count: file.tracks.iter().map(|track| track.note_event_count).sum(),
+                        likely_drums: file.tracks.iter().any(|track| track.likely_drum),
+                        added_at: track_library::now_seconds(),
+                        last_practiced_at: None,
+                        last_accuracy: None,
+                    });
+                    let _ = track_library::save(&self.track_library);
+                }
+                self.library_selected_path = Some(path.to_string_lossy().into_owned());
                 self.midi_import_error = None;
-                self.last_transport_update = Instant::now();
-                self.view = View::MidiInspection;
+                self.view = View::TrackLibrary;
             }
             Err(error) => {
                 self.midi_import_error = Some(error.to_string());
-                self.view = View::MidiInspection;
+                self.view = View::TrackLibrary;
             }
         }
     }
@@ -300,6 +453,98 @@ impl DrumApp {
             file.duration_ticks,
         ));
     }
+
+    fn open_library_entry(&mut self, path: &str) -> Result<(), String> {
+        let file = MidiFile::from_path(path).map_err(|error| error.to_string())?;
+        self.selected_drum_track = file.suggested_drum_track();
+        self.transport = Some(MusicalTransport::from_midi_file(&file));
+        self.imported_midi = Some(file);
+        self.current_library_path = Some(path.to_string());
+        self.library_selected_path = Some(path.to_string());
+        self.completion_saved = false;
+        self.rebuild_timeline();
+        self.metronome.reset();
+        self.last_transport_update = Instant::now();
+        Ok(())
+    }
+
+    fn restart_practice(&mut self, play: bool) {
+        self.completion_saved = false;
+        self.count_in_active = false;
+        let Some(transport) = self.transport.as_mut() else {
+            return;
+        };
+        transport.seek(0);
+        self.metronome.reset();
+        if let Some(session) = self.practice_session.as_mut() {
+            session.on_seek_to_tick(0, transport);
+        }
+        self.displayed_practice_result = None;
+        self.displayed_result_since = None;
+        self.observed_practice_result_count = 0;
+        if play {
+            if self.count_in_bars > 0 {
+                self.count_in_active = true;
+                self.count_in_target_tick = 0;
+                self.count_in_end_tick = transport
+                    .position_map()
+                    .tick_at_measure(self.count_in_bars as u64 + 1, transport.final_tick());
+            }
+            transport.play();
+        }
+        self.last_transport_update = Instant::now();
+    }
+
+    fn stop_practice(&mut self) {
+        let Some(transport) = self.transport.as_mut() else {
+            return;
+        };
+        transport.stop();
+        self.metronome.reset();
+        if let Some(session) = self.practice_session.as_mut() {
+            session.on_stop();
+        }
+        self.displayed_practice_result = None;
+        self.displayed_result_since = None;
+        self.observed_practice_result_count = 0;
+    }
+
+    fn active_loop_region(&self) -> Option<(u64, u64)> {
+        (self.practice_loop_mode != PracticeLoopMode::Off
+            && self.practice_loop_start_tick < self.practice_loop_end_tick)
+            .then_some((self.practice_loop_start_tick, self.practice_loop_end_tick))
+    }
+
+    fn configure_loop(&mut self, mode: PracticeLoopMode) {
+        self.practice_loop_mode = mode;
+        self.practice_loop_iteration = 1;
+        let Some(transport) = self.transport.as_ref() else {
+            return;
+        };
+        let current_bar = transport.musical_position().measure;
+        let final_tick = transport.final_tick();
+        let last_bar = transport
+            .position_map()
+            .position_at_tick(final_tick)
+            .measure;
+        if let Some(bars) = mode.bars() {
+            self.practice_loop_start_bar = current_bar;
+            self.practice_loop_end_bar = (current_bar + bars).min(last_bar + 1);
+        } else if mode == PracticeLoopMode::Custom {
+            self.practice_loop_start_bar = self.practice_loop_start_bar.clamp(1, last_bar);
+            self.practice_loop_end_bar = self
+                .practice_loop_end_bar
+                .clamp(self.practice_loop_start_bar + 1, last_bar + 1);
+        } else {
+            return;
+        }
+        self.practice_loop_start_tick = transport
+            .position_map()
+            .tick_at_measure(self.practice_loop_start_bar, final_tick);
+        self.practice_loop_end_tick = transport
+            .position_map()
+            .tick_at_measure(self.practice_loop_end_bar, final_tick);
+    }
 }
 impl eframe::App for DrumApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -317,7 +562,7 @@ impl eframe::App for DrumApp {
                 self.wizard_device = None;
                 self.mapping_draft = None;
                 self.status =
-                    "Device disconnected — re-connect or check the cable/port.".to_string();
+                    "Device disconnected - re-connect or check the cable/port.".to_string();
             }
         }
 
@@ -325,13 +570,38 @@ impl eframe::App for DrumApp {
         let elapsed = now.duration_since(self.last_transport_update);
         self.last_transport_update = now;
         let mut reached_song_end = false;
+        let loop_region = if self.count_in_active {
+            None
+        } else {
+            self.active_loop_region()
+        };
+        let mut loop_wraps = 0;
         if let Some(transport) = self.transport.as_mut() {
             let was_playing = transport.is_playing();
-            transport.advance_by(elapsed);
+            loop_wraps = transport.advance_by_looping(elapsed, loop_region);
+            if self.count_in_active && transport.current_tick() >= self.count_in_end_tick {
+                transport.seek(self.count_in_target_tick.min(i64::MAX as u64) as i64);
+                transport.play();
+                self.count_in_active = false;
+                self.metronome.reset();
+                if let Some(session) = self.practice_session.as_mut() {
+                    session.reset();
+                }
+                self.observed_practice_result_count = 0;
+            }
             reached_song_end = was_playing
                 && !transport.is_playing()
                 && transport.current_tick() == transport.final_tick();
-            if self.metronome_enabled {
+            if loop_wraps > 0 {
+                self.metronome.reset();
+                if self.metronome_enabled {
+                    for event in self.metronome.observe(transport) {
+                        self.click_audio.play(event.kind);
+                    }
+                } else {
+                    self.metronome.sync_to_transport(transport);
+                }
+            } else if self.metronome_enabled || self.count_in_active {
                 for event in self.metronome.observe(transport) {
                     self.click_audio.play(event.kind);
                 }
@@ -347,11 +617,20 @@ impl eframe::App for DrumApp {
 
         // Sample live hits only after bringing the single musical transport up
         // to date for this frame, avoiding a one-frame-old transport tick.
+        if loop_wraps > 0 {
+            if let (Some(session), Some((start, end))) = (&mut self.practice_session, loop_region) {
+                session.on_loop_wrap(start, end);
+                self.practice_loop_iteration += loop_wraps;
+            }
+        }
         self.drain_events();
-        if let (Some(session), Some(transport)) = (&mut self.practice_session, &self.transport) {
-            session.advance_to_tick(transport.current_tick(), transport);
-            if reached_song_end {
-                session.finish();
+        if !self.count_in_active {
+            if let (Some(session), Some(transport)) = (&mut self.practice_session, &self.transport)
+            {
+                session.advance_to_tick(transport.current_tick(), transport);
+                if reached_song_end {
+                    session.finish();
+                }
             }
         }
         if let Some(session) = &self.practice_session {
@@ -364,105 +643,293 @@ impl eframe::App for DrumApp {
                 self.displayed_result_since = Some(now);
             }
             self.observed_practice_result_count = result_count;
-            if self.displayed_result_since.is_some_and(|since| {
-                now.duration_since(since) >= std::time::Duration::from_millis(1_200)
-            }) {
-                self.displayed_practice_result = None;
-                self.displayed_result_since = None;
-            }
         }
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("MIDI Drum Practice");
-            ui.label("Phase 2 — Setup wizard & drum mapping");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("⟳ Refresh devices").clicked() {
-                    self.refresh_devices();
-                }
-
-                let selected_text = self
-                    .ports
-                    .get(self.selected.unwrap_or(usize::MAX))
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| "Select a MIDI input…".to_string());
-                egui::ComboBox::from_id_salt("device_combo")
-                    .width(320.0)
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        if self.ports.is_empty() {
-                            ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
-                        }
-                        for p in &self.ports {
-                            ui.selectable_value(&mut self.selected, Some(p.index), &p.name);
-                        }
-                    });
-
-                if self.connected {
-                    if ui.button("Disconnect").clicked() {
-                        self.disconnect_clicked();
+        if false {
+            egui::TopBottomPanel::top("legacy_header").show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.heading("MIDI Drum Practice");
+                ui.label("Phase 2 - Setup wizard & drum mapping");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh devices").clicked() {
+                        self.refresh_devices();
                     }
-                } else {
-                    let can_connect = self.selected.is_some() && !self.ports.is_empty();
+
+                    let selected_text = self
+                        .ports
+                        .get(self.selected.unwrap_or(usize::MAX))
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "Select a MIDI input...".to_string());
+                    egui::ComboBox::from_id_salt("device_combo")
+                        .width(320.0)
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if self.ports.is_empty() {
+                                ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
+                            }
+                            for p in &self.ports {
+                                ui.selectable_value(&mut self.selected, Some(p.index), &p.name);
+                            }
+                        });
+
+                    if self.connected {
+                        if ui.button("Disconnect").clicked() {
+                            self.disconnect_clicked();
+                        }
+                    } else {
+                        let can_connect = self.selected.is_some() && !self.ports.is_empty();
+                        if ui
+                            .add_enabled(can_connect, egui::Button::new("Connect"))
+                            .clicked()
+                        {
+                            self.connect_clicked();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.view, View::Monitor, "Monitor");
+                    ui.selectable_value(&mut self.view, View::Setup, "Setup Wizard");
+                    ui.selectable_value(&mut self.view, View::TrackLibrary, "Import MIDI");
+                });
+                ui.add_space(4.0);
+                if self.connected {
+                    let mapping_line = match &self.active_config {
+                        Some(cfg) => format!(
+                            "Drum mapping for {}: {}/{} components configured.",
+                            cfg.device_name,
+                            cfg.mapped_count(),
+                            SUPPORTED_COMPONENTS.len()
+                        ),
+                        None => "No drum mapping loaded for this device yet.".to_string(),
+                    };
+                    ui.weak(mapping_line);
+                }
+                ui.add_space(2.0);
+                ui.label(format!(
+                    "Available MIDI input devices: {} | {}",
+                    self.ports.len(),
+                    if self.status.is_empty() {
+                        if self.connected {
+                            format!(
+                                "Listening on {}",
+                                self.backend.connected_port_name().unwrap_or("?")
+                            )
+                        } else {
+                            "Idle - select a device and press Connect.".to_string()
+                        }
+                    } else {
+                        self.status.clone()
+                    }
+                ));
+                ui.add_space(4.0);
+                ui.separator();
+            });
+        }
+
+        let mut import_midi = false;
+        let mut restart = false;
+        let mut start_resume = false;
+        let mut stop = false;
+        let mut go_tracks = false;
+        let mut refresh_midi_devices = false;
+        let mut connect_midi_device = false;
+        let mut disconnect_midi_device = false;
+        egui::TopBottomPanel::top("application_menu").show(ctx, |ui| {
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("MIDI Drum Practice")
+                        .strong()
+                        .size(20.0),
+                );
+                ui.separator();
+                ui.menu_button("File", |ui| {
+                    if ui.button("Import MIDI...").clicked() {
+                        import_midi = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Track Library").clicked() {
+                        go_tracks = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Practice", |ui| {
+                    let available = self.transport.is_some() && self.practice_session.is_some();
                     if ui
-                        .add_enabled(can_connect, egui::Button::new("⏵ Connect"))
+                        .add_enabled(available, egui::Button::new("Restart"))
                         .clicked()
                     {
-                        self.connect_clicked();
+                        restart = true;
+                        ui.close_menu();
                     }
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.view, View::Monitor, "📡 Monitor");
-                ui.selectable_value(&mut self.view, View::Setup, "🎛 Setup Wizard");
-                ui.selectable_value(&mut self.view, View::MidiInspection, "Import MIDI");
-            });
-            ui.add_space(4.0);
-            if self.connected {
-                let mapping_line = match &self.active_config {
-                    Some(cfg) => format!(
-                        "Drum mapping for “{}”: {}/{} components configured.",
-                        cfg.device_name,
-                        cfg.mapped_count(),
-                        SUPPORTED_COMPONENTS.len()
-                    ),
-                    None => "No drum mapping loaded for this device yet.".to_string(),
-                };
-                ui.weak(mapping_line);
-            }
-            ui.add_space(2.0);
-            ui.label(format!(
-                "Available MIDI input devices: {}   ·   {}",
-                self.ports.len(),
-                if self.status.is_empty() {
+                    if ui
+                        .add_enabled(available, egui::Button::new("Start / Resume"))
+                        .clicked()
+                    {
+                        start_resume = true;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(available, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        stop = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Track Library").clicked() {
+                        go_tracks = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("MIDI Monitor").clicked() {
+                        if let Some(transport) = self.transport.as_mut() {
+                            transport.pause();
+                            self.metronome.sync_to_transport(transport);
+                        }
+                        self.view = View::Monitor;
+                        ui.close_menu();
+                    }
+                    if ui.button("Setup Wizard").clicked() {
+                        if let Some(transport) = self.transport.as_mut() {
+                            transport.pause();
+                            self.metronome.sync_to_transport(transport);
+                        }
+                        self.view = View::Setup;
+                        ui.close_menu();
+                    }
+                    if ui.button("Drum Mapping").clicked() {
+                        if let Some(transport) = self.transport.as_mut() {
+                            transport.pause();
+                            self.metronome.sync_to_transport(transport);
+                        }
+                        self.view = View::Mapping;
+                        ui.close_menu();
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.connected {
-                        format!(
-                            "Listening on “{}”",
-                            self.backend.connected_port_name().unwrap_or("?")
-                        )
+                        if ui.button("Disconnect").clicked() {
+                            disconnect_midi_device = true;
+                        }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(90, 210, 135),
+                            egui::RichText::new("Connected").strong(),
+                        );
                     } else {
-                        "Idle — select a device and press Connect.".to_string()
+                        if ui
+                            .add_enabled(
+                                self.selected.is_some() && !self.ports.is_empty(),
+                                egui::Button::new("Connect"),
+                            )
+                            .clicked()
+                        {
+                            connect_midi_device = true;
+                        }
+                        ui.strong("No device connected");
                     }
-                } else {
-                    self.status.clone()
-                }
-            ));
-            ui.add_space(4.0);
-            ui.separator();
+                    let selected_text = if self.connected {
+                        self.backend
+                            .connected_port_name()
+                            .unwrap_or("MIDI device")
+                            .to_string()
+                    } else {
+                        self.ports
+                            .iter()
+                            .find(|port| Some(port.index) == self.selected)
+                            .map(|port| port.name.clone())
+                            .unwrap_or_else(|| {
+                                if self.ports.is_empty() {
+                                    "No MIDI devices found".to_string()
+                                } else {
+                                    "Select MIDI device".to_string()
+                                }
+                            })
+                    };
+                    egui::ComboBox::from_id_salt("header_midi_device")
+                        .width(220.0)
+                        .selected_text(format!("MIDI: {selected_text}"))
+                        .show_ui(ui, |ui| {
+                            if self.ports.is_empty() {
+                                ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
+                            }
+                            for port in &self.ports {
+                                ui.selectable_value(
+                                    &mut self.selected,
+                                    Some(port.index),
+                                    &port.name,
+                                );
+                            }
+                            ui.separator();
+                            if ui.button("Refresh Devices").clicked() {
+                                refresh_midi_devices = true;
+                                ui.close_menu();
+                            }
+                        });
+                });
+            });
+            ui.add_space(5.0);
         });
+        if import_midi {
+            self.import_midi_clicked();
+        }
+        if restart {
+            self.restart_practice(true);
+            self.view = View::Practice;
+        }
+        if start_resume {
+            if let Some(transport) = self.transport.as_mut() {
+                transport.play();
+            }
+            self.view = View::Practice;
+        }
+        if stop {
+            self.stop_practice();
+        }
+        if go_tracks {
+            if let Some(transport) = self.transport.as_mut() {
+                transport.pause();
+                self.metronome.sync_to_transport(transport);
+            }
+            self.view = View::TrackLibrary;
+        }
+        if refresh_midi_devices {
+            self.refresh_devices();
+        }
+        if disconnect_midi_device {
+            self.disconnect_clicked();
+        } else if connect_midi_device {
+            self.connect_clicked();
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // A vertically scrollable content area is shared by all views so
-            // the wizard/mapping tables never get clipped on small windows.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match self.view {
-                    View::Monitor => show_monitor_ui(self, ui),
-                    View::Setup => wizard_ui::show(self, ui),
-                    View::MidiInspection => midi_file_ui::show(self, ui),
-                });
+            if self.view == View::Practice {
+                midi_file_ui::show_practice(self, ui);
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if matches!(self.view, View::Monitor | View::Setup | View::Mapping)
+                            && settings_back_button(self, ui)
+                        {
+                            return;
+                        }
+                        match self.view {
+                            View::Monitor => show_monitor_ui(self, ui),
+                            View::Setup => wizard_ui::show(self, ui),
+                            View::Mapping => mapping_ui::show(self, ui),
+                            View::TrackLibrary => midi_file_ui::show(self, ui),
+                            View::Practice => unreachable!(),
+                        }
+                    });
+            }
         });
 
         // This second check covers a Play click made during the UI pass above.
@@ -477,9 +944,68 @@ impl eframe::App for DrumApp {
     }
 }
 
+fn settings_back_button(app: &mut DrumApp, ui: &mut egui::Ui) -> bool {
+    let has_practice = app.transport.is_some() && app.practice_session.is_some();
+    let label = if has_practice {
+        "Back to Practice"
+    } else {
+        "Your Tracks"
+    };
+    if ui.button(label).clicked() {
+        app.view = if has_practice {
+            View::Practice
+        } else {
+            View::TrackLibrary
+        };
+        true
+    } else {
+        ui.add_space(8.0);
+        false
+    }
+}
+
 /// Phase 1 live MIDI monitor view (unchanged behaviour, moved into the tab).
 fn show_monitor_ui(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
+    ui.heading("MIDI Monitor");
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Refresh devices").clicked() {
+            app.refresh_devices();
+        }
+        let selected_text = app
+            .ports
+            .get(app.selected.unwrap_or(usize::MAX))
+            .map(|port| port.name.clone())
+            .unwrap_or_else(|| "Select a MIDI input...".to_string());
+        egui::ComboBox::from_id_salt("monitor_device_combo")
+            .width(320.0)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if app.ports.is_empty() {
+                    ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
+                }
+                for port in &app.ports {
+                    ui.selectable_value(&mut app.selected, Some(port.index), &port.name);
+                }
+            });
+        if app.connected {
+            if ui.button("Disconnect").clicked() {
+                app.disconnect_clicked();
+            }
+        } else if ui
+            .add_enabled(
+                app.selected.is_some() && !app.ports.is_empty(),
+                egui::Button::new("Connect"),
+            )
+            .clicked()
+        {
+            app.connect_clicked();
+        }
+    });
+    if !app.status.is_empty() {
+        ui.weak(&app.status);
+    }
+    ui.separator();
     ui.heading("Latest event");
     ui.separator();
 
@@ -526,23 +1052,35 @@ fn set_app_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals.dark_mode = true;
     style.visuals.override_text_color = Some(egui::Color32::from_rgb(220, 222, 218));
+    style.spacing.interact_size = egui::vec2(44.0, 30.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(25.0));
     ctx.set_style(style);
 }
 
 fn fmt_opt(value: Option<u8>) -> String {
     match value {
         Some(v) => v.to_string(),
-        None => "— (n/a)".to_string(),
+        None => "N/A".to_string(),
     }
 }
 
 fn timestamp_text(us: u64) -> String {
-    format!("{} µs  (≈ {:.3} s)", us, us as f64 / 1_000_000.0)
+    format!("{} us (~{:.3} s)", us, us as f64 / 1_000_000.0)
 }
 
 fn fmt_event(ev: &MidiEvent) -> String {
     format!(
-        "{:>12} µs  {:<17} ch={:<4} note={:<5} vel={:<4}",
+        "{:>12} us  {:<17} ch={:<4} note={:<5} vel={:<4}",
         ev.timestamp_micros,
         ev.message.kind.name(),
         fmt_opt(ev.message.channel_number()),
