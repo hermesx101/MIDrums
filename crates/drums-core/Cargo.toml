@@ -9,3 +9,4 @@ description = "Hardware-independent MIDI logic for the DRUMS practice applicatio
 midir.workspace = true
 serde.workspace = true
 toml.workspace = true
+midly.workspace = true

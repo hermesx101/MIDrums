@@ -14,5 +14,5 @@ pub use mapping::{
     DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingStore,
     SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
 };
-pub use midi::{MidiBackend, MidiError, MidiEvent, MidiMessage, MidiParser, MessageKind, PortInfo};
+pub use midi::{general_midi_component, ExpectedNote, MidiBackend, MidiError, MidiEvent, MidiFile, MidiFileError, MidiMessage, MidiParser, MidiTiming, MessageKind, PortInfo};
 pub use time::{Clock, SharedClock, SystemClock};

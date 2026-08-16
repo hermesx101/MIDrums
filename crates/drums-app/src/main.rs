@@ -16,13 +16,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod mapping_ui;
+mod midi_file_ui;
 mod wizard_ui;
 
 use std::sync::Arc;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{MidiBackend, MidiEvent, PortInfo};
+use drums_core::{MidiBackend, MidiEvent, MidiFile, PortInfo};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -32,6 +33,7 @@ enum View {
     Monitor,
     /// Phase 2 setup wizard.
     Setup,
+    MidiInspection,
 }
 
 fn main() -> eframe::Result {
@@ -71,6 +73,9 @@ struct DrumApp {
     mapping_draft: Option<DrumKitConfiguration>,
     /// Currently selected view/tab.
     view: View,
+    imported_midi: Option<MidiFile>,
+    selected_drum_track: Option<usize>,
+    midi_import_error: Option<String>,
 }
 
 impl DrumApp {
@@ -109,6 +114,9 @@ impl DrumApp {
             wizard_device: None,
             mapping_draft: None,
             view: View::Monitor,
+            imported_midi: None,
+            selected_drum_track: None,
+            midi_import_error: None,
         }
     }
 
@@ -181,6 +189,14 @@ impl DrumApp {
         self.mapping_draft = None;
         self.status = "Disconnected.".to_string();
     }
+
+    fn import_midi_clicked(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("MIDI files", &["mid", "midi"]).set_title("Import MIDI file").pick_file() else { return; };
+        match MidiFile::from_path(&path) {
+            Ok(file) => { self.selected_drum_track = file.suggested_drum_track(); self.imported_midi = Some(file); self.midi_import_error = None; self.view = View::MidiInspection; }
+            Err(error) => { self.midi_import_error = Some(error.to_string()); self.view = View::MidiInspection; }
+        }
+    }
 }
 impl eframe::App for DrumApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -249,6 +265,7 @@ impl eframe::App for DrumApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, View::Monitor, "📡 Monitor");
                 ui.selectable_value(&mut self.view, View::Setup, "🎛 Setup Wizard");
+                ui.selectable_value(&mut self.view, View::MidiInspection, "Import MIDI");
             });
             ui.add_space(4.0);
             if self.connected {
@@ -292,6 +309,7 @@ impl eframe::App for DrumApp {
                 .show(ui, |ui| match self.view {
                     View::Monitor => show_monitor_ui(self, ui),
                     View::Setup => wizard_ui::show(self, ui),
+                    View::MidiInspection => midi_file_ui::show(self, ui),
                                                         });
         });
     }
