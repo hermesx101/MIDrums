@@ -11,14 +11,16 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let Some(file) = app.imported_midi.as_ref() else { ui.add_space(12.0); ui.heading("MIDI FILE INSPECTION"); ui.separator(); ui.label("Choose a .mid or .midi file to inspect its tracks and drum events."); ui.weak("This view imports and inspects data only; it does not play MIDI files."); return; };
     metadata(ui, file);
     ui.add_space(14.0); ui.heading("TRACKS"); ui.separator();
+    let mut selected_track_changed = false;
     for track in &file.tracks {
         let title = format!("Track {} - {}  ({} events, {} notes, channels: {}){}", track.index + 1, track.name.as_deref().unwrap_or("Unnamed"), track.event_count, track.note_event_count, channels(&track.channels), if track.likely_drum { "  * likely drums" } else { "" });
-        ui.selectable_value(&mut app.selected_drum_track, Some(track.index), title);
+        selected_track_changed |= ui.selectable_value(&mut app.selected_drum_track, Some(track.index), title).changed();
     }
     if file.suggested_drum_track().is_none() { ui.weak("No obvious drum track was detected. Select a track to inspect manually."); } else { ui.weak("Likely drum tracks are suggestions; choose any track to override them."); }
     ui.add_space(14.0); ui.heading("DRUM EVENTS"); ui.separator();
     let Some(selected_track) = app.selected_drum_track else { ui.weak("Select a track above."); return; };
     let expected = file.expected_notes_for_track(selected_track, app.active_config.as_ref());
+    transport_controls(app, ui);
     if expected.is_empty() { ui.weak("This track contains no Note On events with velocity above zero."); return; }
     egui::Grid::new("midi_file_events").striped(true).num_columns(7).spacing([16.0, 4.0]).show(ui, |ui| {
         ui.strong("Time"); ui.strong("Tick"); ui.strong("MIDI"); ui.strong("Component"); ui.strong("Target"); ui.strong("Velocity"); ui.strong("Channel"); ui.end_row();
@@ -35,6 +37,34 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     });
     if expected.len() > 1_000 { ui.weak(format!("Showing the first 1,000 of {} note events.", expected.len())); }
     if app.active_config.is_none() { ui.weak("General MIDI components are shown directly. Connect a configured kit to see physical targets."); }
+    if selected_track_changed { app.rebuild_timeline(); }
+}
+
+fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
+    let Some(transport) = app.transport.as_mut() else { return; };
+    ui.add_space(8.0);
+    ui.heading("TRANSPORT");
+    ui.horizontal(|ui| {
+        if ui.button("Play").clicked() { transport.play(); }
+        if ui.button("Pause").clicked() { transport.pause(); }
+        if ui.button("Stop").clicked() { transport.stop(); }
+        if ui.button("Beginning").clicked() { transport.seek(0); }
+        if ui.button("End").clicked() { transport.seek_to_end(); }
+    });
+    let mut requested_tick = transport.current_tick();
+    if ui.add(egui::Slider::new(&mut requested_tick, 0..=transport.final_tick()).text("Seek tick")).changed() {
+        transport.seek(requested_tick.min(i64::MAX as u64) as i64);
+    }
+    let musical = transport.musical_position();
+    egui::Grid::new("transport_position").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+        ui.label("State:"); ui.monospace(format!("{:?}", transport.state())); ui.end_row();
+        ui.label("Tempo:"); ui.monospace(format!("{:.1} BPM", transport.current_bpm())); ui.end_row();
+        ui.label("Musical position:"); ui.monospace(format!("Bar {}  Beat {}  + {}/{} ticks", musical.measure, musical.beat, musical.ticks_into_beat, musical.ticks_per_beat)); ui.end_row();
+        ui.label("Elapsed:"); ui.monospace(format!("{} / {}", time_text(transport.elapsed_seconds()), time_text(transport.total_seconds()))); ui.end_row();
+        ui.label("Current tick:"); ui.monospace(format!("{} / {}", transport.current_tick(), transport.final_tick())); ui.end_row();
+    });
+    if let Some(timeline) = &app.timeline { ui.weak(format!("Timeline model: {} expected events.", timeline.events.len())); }
+    ui.separator();
 }
 
 fn metadata(ui: &mut egui::Ui, file: &MidiFile) {
@@ -48,4 +78,5 @@ fn metadata(ui: &mut egui::Ui, file: &MidiFile) {
 }
 fn timing_text(timing: MidiTiming) -> String { match timing { MidiTiming::TicksPerQuarter(ticks) => format!("{ticks} ticks per quarter note"), MidiTiming::Timecode { frames_per_second, ticks_per_frame } => format!("SMPTE: {frames_per_second} fps, {ticks_per_frame} ticks/frame") } }
 fn duration_text(seconds: f64) -> String { format!("{:02}:{:02}", (seconds / 60.0).floor() as u64, (seconds as u64) % 60) }
+fn time_text(seconds: f64) -> String { format!("{:02}:{:05.2}", (seconds / 60.0).floor() as u64, seconds % 60.0) }
 fn channels(channels: &[u8]) -> String { if channels.is_empty() { "none".to_string() } else { channels.iter().map(|channel| (channel + 1).to_string()).collect::<Vec<_>>().join(", ") } }

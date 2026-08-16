@@ -20,10 +20,11 @@ mod midi_file_ui;
 mod wizard_ui;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use drums_core::mapping::{DrumKitConfiguration, MappingStore, SetupWizard, SUPPORTED_COMPONENTS};
 use drums_core::time::{SharedClock, SystemClock};
-use drums_core::{MidiBackend, MidiEvent, MidiFile, PortInfo};
+use drums_core::{MidiBackend, MidiEvent, MidiFile, MusicalTransport, PortInfo, Timeline};
 use eframe::egui;
 
 /// Top-level views the app can show.
@@ -76,6 +77,9 @@ struct DrumApp {
     imported_midi: Option<MidiFile>,
     selected_drum_track: Option<usize>,
     midi_import_error: Option<String>,
+    transport: Option<MusicalTransport>,
+    timeline: Option<Timeline>,
+    last_transport_update: Instant,
 }
 
 impl DrumApp {
@@ -117,6 +121,9 @@ impl DrumApp {
             imported_midi: None,
             selected_drum_track: None,
             midi_import_error: None,
+            transport: None,
+            timeline: None,
+            last_transport_update: Instant::now(),
         }
     }
 
@@ -193,9 +200,26 @@ impl DrumApp {
     fn import_midi_clicked(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("MIDI files", &["mid", "midi"]).set_title("Import MIDI file").pick_file() else { return; };
         match MidiFile::from_path(&path) {
-            Ok(file) => { self.selected_drum_track = file.suggested_drum_track(); self.imported_midi = Some(file); self.midi_import_error = None; self.view = View::MidiInspection; }
+            Ok(file) => {
+                self.selected_drum_track = file.suggested_drum_track();
+                self.transport = Some(MusicalTransport::from_midi_file(&file));
+                self.imported_midi = Some(file);
+                self.rebuild_timeline();
+                self.midi_import_error = None;
+                self.last_transport_update = Instant::now();
+                self.view = View::MidiInspection;
+            }
             Err(error) => { self.midi_import_error = Some(error.to_string()); self.view = View::MidiInspection; }
         }
+    }
+
+    fn rebuild_timeline(&mut self) {
+        let (Some(file), Some(track), Some(transport)) = (&self.imported_midi, self.selected_drum_track, &self.transport) else {
+            self.timeline = None;
+            return;
+        };
+        let notes = file.expected_notes_for_track(track, self.active_config.as_ref());
+        self.timeline = Some(Timeline::from_expected_notes(notes, transport.position_map(), file.duration_ticks));
     }
 }
 impl eframe::App for DrumApp {
@@ -219,6 +243,18 @@ impl eframe::App for DrumApp {
         }
 
         self.drain_events();
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_transport_update);
+        self.last_transport_update = now;
+        if let Some(transport) = self.transport.as_mut() {
+            transport.advance_by(elapsed);
+            if transport.is_playing() {
+                // Rendering is not the clock: this only schedules a future
+                // frame so the elapsed monotonic-time transport can be shown.
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -312,6 +348,12 @@ impl eframe::App for DrumApp {
                     View::MidiInspection => midi_file_ui::show(self, ui),
                                                         });
         });
+
+        // This second check covers a Play click made during the UI pass above.
+        // The transport itself remains driven solely by elapsed monotonic time.
+        if self.transport.as_ref().is_some_and(|transport| transport.is_playing()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 }
 
