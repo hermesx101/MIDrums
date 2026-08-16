@@ -16,9 +16,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod click_audio;
+mod backing_audio;
 mod mapping_ui;
 mod midi_file_ui;
 mod performance_analysis_ui;
+mod progress_ui;
+mod practice_settings;
 mod track_library;
 mod wizard_ui;
 
@@ -47,6 +50,7 @@ enum View {
     TrackLibrary,
     Practice,
     PerformanceAnalysis,
+    Progress,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,11 +182,21 @@ struct DrumApp {
     completion_saved: bool,
     analysis_track_path: Option<String>,
     analysis_session_id: Option<String>,
+    progress_track_path: Option<String>,
+    progress_data: Option<drums_core::TrackProgress>,
     click_audio: click_audio::ClickAudio,
+    backing_audio: backing_audio::BackingAudio,
+    audio_sync_offset_ms: f64,
+    midi_input_latency_ms: f64,
+    start_audio_with_practice: bool,
 }
 
 impl DrumApp {
+    fn save_practice_settings(&self) {
+        let _ = practice_settings::save(&practice_settings::PracticeSettings { midi_input_latency_ms:self.midi_input_latency_ms, audio_sync_offset_ms:self.audio_sync_offset_ms, start_audio_with_practice:self.start_audio_with_practice });
+    }
     fn new(ctx: &eframe::CreationContext<'_>) -> Self {
+        let practice_settings = practice_settings::load();
         let clock: SharedClock = Arc::new(SystemClock::new());
         let mut backend = MidiBackend::new(clock.clone());
 
@@ -265,7 +279,13 @@ impl DrumApp {
             completion_saved: false,
             analysis_track_path: None,
             analysis_session_id: None,
+            progress_track_path: None,
+            progress_data: None,
             click_audio: click_audio::ClickAudio::new(),
+            backing_audio: backing_audio::BackingAudio::new(),
+            audio_sync_offset_ms: practice_settings.audio_sync_offset_ms,
+            midi_input_latency_ms: practice_settings.midi_input_latency_ms,
+            start_audio_with_practice: practice_settings.start_audio_with_practice,
         }
     }
 
@@ -317,12 +337,14 @@ impl DrumApp {
                 });
             }
             if let (Some(config), Some(transport)) = (&self.active_config, &self.transport) {
-                if let Some(hit) = ActualHit::from_midi_event_observed_at(
+                if let Some(mut hit) = ActualHit::from_midi_event_observed_at(
                     &ev,
                     config,
                     transport,
                     observed_at_micros,
                 ) {
+                    hit.elapsed_seconds = drums_core::compensate_midi_input(hit.elapsed_seconds, self.midi_input_latency_ms);
+                    hit.transport_tick = transport.effective_tick_at_seconds(hit.elapsed_seconds);
                     self.last_live_hit = Some(hit.clone());
                     if transport.is_playing() && !self.count_in_active {
                         if let Some(session) = self.practice_session.as_mut() {
@@ -477,6 +499,7 @@ impl DrumApp {
     }
 
     fn open_library_entry(&mut self, path: &str) -> Result<(), String> {
+        self.backing_audio.unload();
         let file = MidiFile::from_path(path).map_err(|error| error.to_string())?;
         self.selected_drum_track = file.suggested_drum_track();
         self.transport = Some(MusicalTransport::from_midi_file(&file));
@@ -517,6 +540,9 @@ impl DrumApp {
             transport.play();
         }
         self.last_transport_update = Instant::now();
+        if play && self.start_audio_with_practice && self.backing_audio.is_loaded() {
+            if self.count_in_active { self.backing_audio.pause(); } else { let p=drums_core::audio_position(0.0,self.audio_sync_offset_ms,self.backing_audio.duration());let _=self.backing_audio.seek(p);self.backing_audio.play(); }
+        } else { self.backing_audio.stop(); }
     }
 
     fn stop_practice(&mut self) {
@@ -532,6 +558,7 @@ impl DrumApp {
         self.displayed_result_since = None;
         self.observed_practice_result_count = 0;
         self.active_session_recording = None;
+        self.backing_audio.stop();
     }
 
     fn begin_session_recording_if_needed(&mut self) {
@@ -687,11 +714,20 @@ impl eframe::App for DrumApp {
                     session.reset();
                 }
                 self.observed_practice_result_count = 0;
+                if self.start_audio_with_practice && self.backing_audio.is_loaded() {
+                    let position = drums_core::audio_position(transport.elapsed_seconds(), self.audio_sync_offset_ms, self.backing_audio.duration());
+                    let _ = self.backing_audio.seek(position);
+                    self.backing_audio.play();
+                }
             }
             reached_song_end = was_playing
                 && !transport.is_playing()
                 && transport.current_tick() == transport.final_tick();
             if loop_wraps > 0 {
+                if self.start_audio_with_practice && self.backing_audio.is_loaded() {
+                    let position = drums_core::audio_position(transport.elapsed_seconds(), self.audio_sync_offset_ms, self.backing_audio.duration());
+                    let _ = self.backing_audio.seek(position);
+                }
                 self.metronome.reset();
                 if self.metronome_enabled {
                     for event in self.metronome.observe(transport) {
@@ -744,6 +780,7 @@ impl eframe::App for DrumApp {
             self.observed_practice_result_count = result_count;
         }
         if reached_song_end {
+            self.backing_audio.stop();
             self.persist_completed_session();
         }
 
@@ -891,12 +928,20 @@ impl eframe::App for DrumApp {
                     }
                 });
                 ui.menu_button("Settings", |ui| {
+                    ui.strong("Practice / Timing");
+                    let mut timing_settings_changed=false;
+                    ui.horizontal(|ui| { ui.label("MIDI Input Latency").on_hover_text("Compensates for delay between a physical drum hit and MIDI reception."); timing_settings_changed|=ui.add(egui::DragValue::new(&mut self.midi_input_latency_ms).range(0.0..=500.0).suffix(" ms")).changed(); });
+                    ui.horizontal(|ui| { ui.label("Audio Sync Offset").on_hover_text("Shifts backing-track playback relative to the MIDI timeline."); timing_settings_changed|=ui.add(egui::DragValue::new(&mut self.audio_sync_offset_ms).range(-1000.0..=1000.0).suffix(" ms")).changed(); });
+                    if timing_settings_changed { self.save_practice_settings(); if let Some(transport)=self.transport.as_ref(){let p=drums_core::audio_position(transport.elapsed_seconds(),self.audio_sync_offset_ms,self.backing_audio.duration());let _=self.backing_audio.seek(p);} }
+                    ui.weak("Timing tolerance remains the note-matching window; these values do not change it.");
+                    ui.separator();
                     if ui.button("MIDI Monitor").clicked() {
                         if let Some(transport) = self.transport.as_mut() {
                             transport.pause();
                             self.metronome.sync_to_transport(transport);
                         }
                         self.view = View::Monitor;
+                        self.backing_audio.stop();
                         ui.close_menu();
                     }
                     if ui.button("Setup Wizard").clicked() {
@@ -905,6 +950,7 @@ impl eframe::App for DrumApp {
                             self.metronome.sync_to_transport(transport);
                         }
                         self.view = View::Setup;
+                        self.backing_audio.stop();
                         ui.close_menu();
                     }
                     if ui.button("Drum Mapping").clicked() {
@@ -913,6 +959,7 @@ impl eframe::App for DrumApp {
                             self.metronome.sync_to_transport(transport);
                         }
                         self.view = View::Mapping;
+                        self.backing_audio.stop();
                         ui.close_menu();
                     }
                 });
@@ -989,6 +1036,7 @@ impl eframe::App for DrumApp {
         if start_resume {
             if let Some(transport) = self.transport.as_mut() {
                 transport.play();
+                if self.start_audio_with_practice && self.backing_audio.is_loaded() { let p=drums_core::audio_position(transport.elapsed_seconds(),self.audio_sync_offset_ms,self.backing_audio.duration());let _=self.backing_audio.seek(p);self.backing_audio.play(); }
             }
             self.view = View::Practice;
         }
@@ -1001,6 +1049,7 @@ impl eframe::App for DrumApp {
                 self.metronome.sync_to_transport(transport);
             }
             self.view = View::TrackLibrary;
+            self.backing_audio.stop();
         }
         if refresh_midi_devices {
             self.refresh_devices();
@@ -1013,7 +1062,10 @@ impl eframe::App for DrumApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.view == View::Practice {
-                midi_file_ui::show_practice(self, ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("practice_page_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| midi_file_ui::show_practice(self, ui));
             } else {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
@@ -1029,6 +1081,7 @@ impl eframe::App for DrumApp {
                             View::Mapping => mapping_ui::show(self, ui),
                             View::TrackLibrary => midi_file_ui::show(self, ui),
                             View::PerformanceAnalysis => performance_analysis_ui::show(self, ui),
+                            View::Progress => progress_ui::show(self, ui),
                             View::Practice => unreachable!(),
                         }
                     });
@@ -1037,7 +1090,7 @@ impl eframe::App for DrumApp {
 
         // This second check covers a Play click made during the UI pass above.
         // The transport itself remains driven solely by elapsed monotonic time.
-        if self
+        if self.backing_audio.is_playing() || self
             .transport
             .as_ref()
             .is_some_and(|transport| transport.is_playing())

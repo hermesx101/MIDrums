@@ -7,9 +7,11 @@
 //! front-end.
 
 pub mod mapping;
+pub mod audio_sync;
 pub mod midi;
 pub mod performance;
 pub mod practice;
+pub mod progress;
 pub mod session_history;
 pub mod time;
 
@@ -17,6 +19,7 @@ pub use mapping::{
     DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingStore, SetupWizard,
     SetupWizardState, SUPPORTED_COMPONENTS,
 };
+pub use audio_sync::{audio_position, compensate_midi_input, looped_audio_position};
 pub use midi::{
     count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote,
     MessageKind, Metronome, MetronomeEvent, MidiBackend, MidiError, MidiEvent, MidiFile,
@@ -31,6 +34,7 @@ pub use practice::{
     ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget,
     TargetState, TimingConfig, TimingJudgment,
 };
+pub use progress::{DrumProgressPoint, SessionProgressPoint, TrackProgress, WeakestDrum};
 pub use session_history::{
     CompletedPracticeSession, DrumSessionStatistics, PracticeHitRecord, PracticeSessionStore,
     SessionBuildMetadata, SessionStatistics, new_session_id,

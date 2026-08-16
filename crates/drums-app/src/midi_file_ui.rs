@@ -217,7 +217,7 @@ fn library_card(
                 }
             });
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Practice  >").clicked() {
                     *practice_path = Some(entry.path.clone());
@@ -534,7 +534,58 @@ pub fn show_practice(app: &mut DrumApp, ui: &mut egui::Ui) {
         );
     }
     let expected = file.expected_notes_for_track(track, app.active_config.as_ref());
+    backing_audio_controls(app, ui);
     practice_interface(app, ui, &expected);
+}
+
+fn backing_audio_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
+    let loaded = app.backing_audio.is_loaded();
+    let mut choose_audio = false;
+    let mut remove_audio = false;
+    let mut seek = app.backing_audio.position();
+    let duration = app.backing_audio.duration();
+    let mut seek_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("AUDIO BACKING TRACK");
+        if !loaded {
+            ui.weak("No backing track loaded");
+            choose_audio = ui.button("Add Backing Track").clicked();
+            return;
+        }
+        ui.label(app.backing_audio.path().and_then(|p| p.file_name()).and_then(|p| p.to_str()).unwrap_or("Audio"));
+        if ui.small_button("Play").clicked() { app.backing_audio.play(); }
+        if ui.small_button("Pause").clicked() { app.backing_audio.pause(); }
+        if ui.small_button("Stop").clicked() { app.backing_audio.stop(); seek = 0.0; }
+        ui.monospace(format!("{} / {}", time_text(seek), time_text(duration)));
+        seek_changed = ui.add_sized([220.0, 20.0], egui::Slider::new(&mut seek, 0.0..=duration.max(0.001)).show_value(false).text("Seek")).changed();
+        let mut volume = app.backing_audio.volume();
+        if ui.add_sized([135.0, 20.0], egui::Slider::new(&mut volume, 0.0..=1.0).text("Volume")).changed() { app.backing_audio.set_volume(volume); }
+        let mut muted = app.backing_audio.muted();
+        if ui.checkbox(&mut muted, "Mute").changed() { app.backing_audio.set_muted(muted); }
+        if ui.checkbox(&mut app.start_audio_with_practice, "Start audio with practice").changed() { app.save_practice_settings(); }
+        choose_audio = ui.small_button("Replace Audio").clicked();
+        remove_audio = ui.small_button("Remove Audio").clicked();
+    });
+    if loaded && app.transport.as_ref().is_some_and(|t| (t.practice_starting_bpm() - t.original_bpm()).abs() > 0.1) {
+        ui.weak("Backing audio remains at its original speed while Practice BPM differs.");
+    }
+    ui.separator();
+    if seek_changed {
+        let _ = app.backing_audio.seek(seek);
+        if let Some(transport) = app.transport.as_mut() {
+            let midi_seconds = (seek - app.audio_sync_offset_ms / 1_000.0).max(0.0);
+            transport.seek(transport.effective_tick_at_seconds(midi_seconds).min(i64::MAX as u64) as i64);
+            if let Some(session) = app.practice_session.as_mut() { session.on_seek_to_tick(transport.current_tick(), transport); }
+        }
+    }
+    if remove_audio { app.backing_audio.unload(); app.status = "Backing audio removed from the current practice context.".into(); }
+    if choose_audio {
+        let Some(path) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "wav", "ogg", "flac"]).set_title("Choose backing track").pick_file() else { return; };
+        match app.backing_audio.load(path) {
+            Ok(()) => app.status = "Backing audio loaded for the current practice.".into(),
+            Err(error) => app.status = format!("Could not load audio file. Reason: {error}"),
+        }
+    }
 }
 
 /// Phase 5A practice composition. Musical state remains owned by drums-core;
@@ -910,10 +961,14 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
             app.metronome.sync_to_transport(transport);
         }
         transport.play();
+        if app.start_audio_with_practice && app.backing_audio.is_loaded() {
+            if app.count_in_active { app.backing_audio.pause(); } else { let p=drums_core::audio_position(transport.elapsed_seconds(),app.audio_sync_offset_ms,app.backing_audio.duration());let _=app.backing_audio.seek(p);app.backing_audio.play(); }
+        }
     }
     if pause {
         transport.pause();
         app.metronome.sync_to_transport(transport);
+        app.backing_audio.pause();
     }
     if stop {
         app.count_in_active = false;
@@ -922,6 +977,7 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
         if let Some(session) = app.practice_session.as_mut() {
             session.on_stop();
         }
+        app.backing_audio.stop();
     }
     if beginning {
         seek_tick = 0;
@@ -935,11 +991,13 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
         if let Some(session) = app.practice_session.as_mut() {
             session.on_seek_to_tick(transport.current_tick(), transport);
         }
+        if app.backing_audio.is_loaded(){let p=drums_core::audio_position(transport.elapsed_seconds(),app.audio_sync_offset_ms,app.backing_audio.duration());let _=app.backing_audio.seek(p);}
     }
     if go_to_tracks {
         transport.pause();
         app.metronome.sync_to_transport(transport);
         app.view = View::TrackLibrary;
+        app.backing_audio.stop();
     }
 }
 
