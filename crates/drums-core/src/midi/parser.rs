@@ -19,7 +19,7 @@
 //! It is therefore safe and cheap to invoke from inside a real-time MIDI
 //! callback.
 
-use super::event::{MidiEvent, MidiMessage, MessageKind};
+use super::event::{MessageKind, MidiEvent, MidiMessage};
 
 /// Streaming parser with internal running-status state.
 #[derive(Clone, Debug, Default)]
@@ -192,7 +192,7 @@ impl MidiParser {
             timestamp_micros: ts,
         });
     }
-    }
+}
 
 /// Number of data bytes a status byte expects, or 0 for messages with none.
 fn expected_data_len(status: u8) -> u8 {
@@ -266,11 +266,14 @@ mod tests {
     fn handles_multiple_messages_in_one_chunk() {
         let mut p = MidiParser::new();
         let events = p.push_bytes(10, &[0x90, 36, 120, 0x90, 38, 90, 0x90, 42, 70]);
-        assert_eq!(kinds(&events), vec![
-            MessageKind::NoteOn,
-            MessageKind::NoteOn,
-            MessageKind::NoteOn,
-        ]);
+        assert_eq!(
+            kinds(&events),
+            vec![
+                MessageKind::NoteOn,
+                MessageKind::NoteOn,
+                MessageKind::NoteOn,
+            ]
+        );
         let notes: Vec<u8> = events.iter().map(|e| e.message.note().unwrap()).collect();
         assert_eq!(notes, vec![36, 38, 42]);
     }
@@ -279,8 +282,8 @@ mod tests {
     fn supports_message_split_across_chunks() {
         let mut p = MidiParser::new();
         assert!(p.push_bytes(10, &[0x90]).is_empty()); // status only
-        assert!(p.push_bytes(20, &[60]).is_empty());   // one data byte
-        let events = p.push_bytes(30, &[105]);         // final data byte
+        assert!(p.push_bytes(20, &[60]).is_empty()); // one data byte
+        let events = p.push_bytes(30, &[105]); // final data byte
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message.kind, MessageKind::NoteOn);
         assert_eq!(events[0].message.note(), Some(60));
@@ -295,7 +298,10 @@ mod tests {
         p.push_bytes(10, &[0x90, 36, 100]);
         // Subsequent data pairs reuse 0x90 (Note On) as running status.
         let events = p.push_bytes(11, &[38, 90, 42, 80]);
-        assert_eq!(kinds(&events), vec![MessageKind::NoteOn, MessageKind::NoteOn]);
+        assert_eq!(
+            kinds(&events),
+            vec![MessageKind::NoteOn, MessageKind::NoteOn]
+        );
         assert_eq!(events[0].message.note(), Some(38));
         assert_eq!(events[0].message.channel, Some(0));
         assert_eq!(events[1].message.note(), Some(42));
@@ -314,11 +320,11 @@ mod tests {
     fn control_change_and_pitch_bend() {
         let mut p = MidiParser::new();
         let events = p.push_bytes(1, &[0xB1, 7, 100, 0xE2, 0x20, 0x30]);
-        assert_eq!(kinds(&events), vec![
-            MessageKind::ControlChange,
-            MessageKind::PitchBend,
-        ]);
-        assert_eq!(events[0].message.data1, Some(7));     // controller number
+        assert_eq!(
+            kinds(&events),
+            vec![MessageKind::ControlChange, MessageKind::PitchBend,]
+        );
+        assert_eq!(events[0].message.data1, Some(7)); // controller number
         assert_eq!(events[0].message.velocity(), Some(100)); // value
         assert_eq!(events[0].message.channel_number(), Some(2));
         assert_eq!(events[1].message.channel_number(), Some(3));
@@ -342,10 +348,10 @@ mod tests {
         let mut p = MidiParser::new();
         // A note-on split by a clock tick (0xF8) in the middle.
         let events = p.push_bytes(1, &[0x90, 60, 0xF8, 100]);
-        assert_eq!(kinds(&events), vec![
-            MessageKind::Realtime,
-            MessageKind::NoteOn,
-        ]);
+        assert_eq!(
+            kinds(&events),
+            vec![MessageKind::Realtime, MessageKind::NoteOn,]
+        );
         assert_eq!(events[0].message.data1, Some(0xF8));
         assert_eq!(events[1].message.note(), Some(60));
         assert_eq!(events[1].message.velocity(), Some(100));

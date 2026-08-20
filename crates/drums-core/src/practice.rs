@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mapping::{DrumComponent, DrumKitConfiguration};
+use crate::mapping::{DrumComponent, DrumKitConfiguration, MappingEventKind, MappingInputIdentity};
 use crate::midi::{ExpectedNote, MessageKind, MidiEvent, MusicalTransport};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,15 +47,11 @@ impl ActualHit {
         }
         let note = event.message.note()?;
         let channel = event.message.channel?;
-        let component = mapping
-            .mappings
-            .iter()
-            .find(|entry| {
-                entry.event_kind == crate::mapping::MappingEventKind::Note
-                    && entry.midi_note == note
-                    && entry.channel == channel + 1
-            })
-            .map(|entry| entry.component);
+        let component = mapping.resolve(MappingInputIdentity {
+            event_kind: MappingEventKind::Note,
+            number: note,
+            channel: channel + 1,
+        });
         let queue_delay_seconds =
             observed_at_micros.saturating_sub(event.timestamp_micros) as f64 / 1_000_000.0;
         let elapsed_seconds = (transport.elapsed_seconds() - queue_delay_seconds).max(0.0);
@@ -630,11 +626,10 @@ mod tests {
         ]);
         s.record_hit(actual(Some(DrumComponent::HiHat), 968), &t);
         s.record_hit(actual(Some(DrumComponent::Kick), 965), &t);
-        assert!(
-            s.results()
-                .iter()
-                .all(|result| result.kind == PracticeResultKind::CorrectHit)
-        );
+        assert!(s
+            .results()
+            .iter()
+            .all(|result| result.kind == PracticeResultKind::CorrectHit));
         assert_eq!(s.pending_count(), 0);
     }
     #[test]
@@ -677,14 +672,12 @@ mod tests {
         );
         s.advance_to_tick(1057, &t);
         assert_eq!(s.results()[1].kind, PracticeResultKind::Ignored);
-        assert!(
-            s.results()[1]
-                .expected
-                .as_ref()
-                .unwrap()
-                .drum_component
-                .is_none()
-        );
+        assert!(s.results()[1]
+            .expected
+            .as_ref()
+            .unwrap()
+            .drum_component
+            .is_none());
     }
     #[test]
     fn empty_expected_and_empty_actual_are_safe() {
@@ -778,6 +771,8 @@ mod tests {
             event_kind: Default::default(),
             midi_note: 24,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         let event = MidiEvent {
             message: MidiMessage {
@@ -796,6 +791,37 @@ mod tests {
         assert_eq!(s.record_hit(hit, &t).kind, PracticeResultKind::CorrectHit);
     }
     #[test]
+    fn every_physical_alias_reaches_scoring_as_the_same_logical_drum() {
+        let t = transport();
+        let mut mapping = DrumKitConfiguration::new("multi-zone ride");
+        for midi_note in [51, 53, 59] {
+            mapping
+                .add_input(DrumMapping {
+                    component: DrumComponent::Ride,
+                    event_kind: MappingEventKind::Note,
+                    midi_note,
+                    channel: 10,
+                    articulation: None,
+                    cc_range: None,
+                })
+                .unwrap();
+        }
+        for midi_note in [51, 53, 59] {
+            let event = MidiEvent {
+                message: MidiMessage {
+                    kind: MessageKind::NoteOn,
+                    channel: Some(9),
+                    data1: Some(midi_note),
+                    data2: Some(100),
+                    system_exclusive: None,
+                },
+                timestamp_micros: 5,
+            };
+            let hit = ActualHit::from_midi_event(&event, &mapping, &t).unwrap();
+            assert_eq!(hit.drum_component, Some(DrumComponent::Ride));
+        }
+    }
+    #[test]
     fn unmapped_and_non_hit_midi_are_handled_safely() {
         let t = transport();
         let mut mapping = DrumKitConfiguration::new("NUX");
@@ -804,6 +830,8 @@ mod tests {
             event_kind: crate::mapping::MappingEventKind::ControlChange,
             midi_note: 4,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         let unmapped = MidiEvent {
             message: MidiMessage {
@@ -815,12 +843,10 @@ mod tests {
             },
             timestamp_micros: 1,
         };
-        assert!(
-            ActualHit::from_midi_event(&unmapped, &mapping, &t)
-                .unwrap()
-                .drum_component
-                .is_none()
-        );
+        assert!(ActualHit::from_midi_event(&unmapped, &mapping, &t)
+            .unwrap()
+            .drum_component
+            .is_none());
         let off = MidiEvent {
             message: MidiMessage {
                 kind: MessageKind::NoteOff,
@@ -855,6 +881,8 @@ mod tests {
             event_kind: Default::default(),
             midi_note: 24,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         let event = MidiEvent {
             message: MidiMessage {

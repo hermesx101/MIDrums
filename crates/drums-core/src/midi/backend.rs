@@ -48,7 +48,10 @@ impl fmt::Display for MidiError {
         match self {
             MidiError::Init(e) => write!(f, "MIDI initialisation failed: {e}"),
             MidiError::PortNotFound { index, available } => {
-                write!(f, "MIDI port {index} is no longer available (only {available} present)")
+                write!(
+                    f,
+                    "MIDI port {index} is no longer available (only {available} present)"
+                )
             }
             MidiError::PortInfo(e) => write!(f, "failed to read MIDI port info: {e}"),
             MidiError::Connect(e) => write!(f, "failed to connect to MIDI device: {e}"),
@@ -102,8 +105,7 @@ impl MidiBackend {
 
     /// Enumerates all currently available MIDI input ports.
     pub fn list_ports(&self) -> Result<Vec<PortInfo>, MidiError> {
-        let input = MidiInput::new("drums-app")
-            .map_err(|e| MidiError::Init(e.to_string()))?;
+        let input = MidiInput::new("drums-app").map_err(|e| MidiError::Init(e.to_string()))?;
         let ports = input.ports();
         let mut out = Vec::with_capacity(ports.len());
         for (index, port) in ports.iter().enumerate() {
@@ -119,8 +121,7 @@ impl MidiBackend {
     /// Subsequent MIDI events are queued onto an internal channel; drain them
     /// with [`Self::poll_events`]. On success returns the connected name.
     pub fn connect(&mut self, port_index: usize) -> Result<String, MidiError> {
-        let input = MidiInput::new("drums-app")
-            .map_err(|e| MidiError::Init(e.to_string()))?;
+        let input = MidiInput::new("drums-app").map_err(|e| MidiError::Init(e.to_string()))?;
         let ports = input.ports();
         let port = ports.get(port_index).ok_or(MidiError::PortNotFound {
             index: port_index,
@@ -211,4 +212,4 @@ impl MidiBackend {
         }
         still_there
     }
-    }
+}

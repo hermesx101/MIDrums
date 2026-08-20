@@ -152,10 +152,24 @@ impl CompletedPracticeSession {
 
 impl SessionStatistics {
     fn calculate(hits: &[PracticeHitRecord], performance: &PracticePerformance) -> Self {
-        let timing = hits.iter().filter_map(|hit| hit.timing_offset_ms).collect::<Vec<_>>();
-        let early = timing.iter().copied().filter(|value| *value < 0.0).collect::<Vec<_>>();
-        let late = timing.iter().copied().filter(|value| *value > 0.0).collect::<Vec<_>>();
-        let velocities = hits.iter().filter_map(|hit| hit.velocity).collect::<Vec<_>>();
+        let timing = hits
+            .iter()
+            .filter_map(|hit| hit.timing_offset_ms)
+            .collect::<Vec<_>>();
+        let early = timing
+            .iter()
+            .copied()
+            .filter(|value| *value < 0.0)
+            .collect::<Vec<_>>();
+        let late = timing
+            .iter()
+            .copied()
+            .filter(|value| *value > 0.0)
+            .collect::<Vec<_>>();
+        let velocities = hits
+            .iter()
+            .filter_map(|hit| hit.velocity)
+            .collect::<Vec<_>>();
         let timing_spread_ms = spread(&timing);
         let mut components = BTreeMap::<DrumComponent, Vec<&PracticeHitRecord>>::new();
         for hit in hits {
@@ -190,13 +204,31 @@ impl SessionStatistics {
 }
 
 fn drum_statistics(hits: &[&PracticeHitRecord]) -> DrumSessionStatistics {
-    let correct_count = hits.iter().filter(|hit| hit.result_kind == PracticeResultKind::CorrectHit).count();
-    let missed_count = hits.iter().filter(|hit| hit.result_kind == PracticeResultKind::Missed).count();
-    let wrong_drum_count = hits.iter().filter(|hit| hit.result_kind == PracticeResultKind::WrongDrum).count();
-    let extra_count = hits.iter().filter(|hit| hit.result_kind == PracticeResultKind::Ignored && hit.actual_drum.is_some()).count();
+    let correct_count = hits
+        .iter()
+        .filter(|hit| hit.result_kind == PracticeResultKind::CorrectHit)
+        .count();
+    let missed_count = hits
+        .iter()
+        .filter(|hit| hit.result_kind == PracticeResultKind::Missed)
+        .count();
+    let wrong_drum_count = hits
+        .iter()
+        .filter(|hit| hit.result_kind == PracticeResultKind::WrongDrum)
+        .count();
+    let extra_count = hits
+        .iter()
+        .filter(|hit| hit.result_kind == PracticeResultKind::Ignored && hit.actual_drum.is_some())
+        .count();
     let finalized_count = correct_count + missed_count + wrong_drum_count;
-    let timing = hits.iter().filter_map(|hit| hit.timing_offset_ms).collect::<Vec<_>>();
-    let velocities = hits.iter().filter_map(|hit| hit.velocity).collect::<Vec<_>>();
+    let timing = hits
+        .iter()
+        .filter_map(|hit| hit.timing_offset_ms)
+        .collect::<Vec<_>>();
+    let velocities = hits
+        .iter()
+        .filter_map(|hit| hit.velocity)
+        .collect::<Vec<_>>();
     let timing_spread_ms = spread(&timing);
     DrumSessionStatistics {
         finalized_count,
@@ -220,12 +252,20 @@ fn mean(values: &[f64]) -> Option<f64> {
 }
 
 fn mean_u8(values: &[u8]) -> Option<f64> {
-    (!values.is_empty()).then(|| values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64)
+    (!values.is_empty())
+        .then(|| values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64)
 }
 
 fn spread(values: &[f64]) -> Option<f64> {
     let average = mean(values)?;
-    Some((values.iter().map(|value| (value - average).powi(2)).sum::<f64>() / values.len() as f64).sqrt())
+    Some(
+        (values
+            .iter()
+            .map(|value| (value - average).powi(2))
+            .sum::<f64>()
+            / values.len() as f64)
+            .sqrt(),
+    )
 }
 
 fn spread_u8(values: &[u8]) -> Option<f64> {
@@ -238,7 +278,11 @@ fn consistency_from_spread(spread_ms: f64) -> f64 {
 }
 
 fn percentage(numerator: usize, denominator: usize) -> f64 {
-    if denominator == 0 { 0.0 } else { numerator as f64 * 100.0 / denominator as f64 }
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
 }
 
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -263,26 +307,46 @@ pub struct PracticeSessionStore {
 }
 
 impl PracticeSessionStore {
-    pub fn new(path: impl AsRef<Path>) -> Self { Self { path: path.as_ref().to_path_buf() } }
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
 
     pub fn default_path() -> PathBuf {
-        if let Ok(path) = std::env::var("DRUMS_HISTORY_PATH") { return PathBuf::from(path); }
+        if let Ok(path) = std::env::var("DRUMS_HISTORY_PATH") {
+            return PathBuf::from(path);
+        }
         #[cfg(target_os = "windows")]
         if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("drums").join("practice-sessions.toml");
+            return PathBuf::from(appdata)
+                .join("drums")
+                .join("practice-sessions.toml");
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".config").join("drums").join("practice-sessions.toml");
+            return PathBuf::from(home)
+                .join(".config")
+                .join("drums")
+                .join("practice-sessions.toml");
         }
         PathBuf::from("practice-sessions.toml")
     }
 
-    pub fn default() -> Self { Self::new(Self::default_path()) }
+    pub fn default() -> Self {
+        Self::new(Self::default_path())
+    }
 
     pub fn append(&self, session: CompletedPracticeSession) -> io::Result<()> {
         let mut file = self.load_file()?;
-        if file.sessions.iter().any(|existing| existing.id == session.id) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "practice session id already exists"));
+        if file
+            .sessions
+            .iter()
+            .any(|existing| existing.id == session.id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "practice session id already exists",
+            ));
         }
         file.sessions.push(session);
         self.write_file(&file)
@@ -293,7 +357,11 @@ impl PracticeSessionStore {
     }
 
     pub fn load_for_track(&self, track_id: &str) -> io::Result<Vec<CompletedPracticeSession>> {
-        let mut sessions = self.load_all()?.into_iter().filter(|session| session.track_id == track_id).collect::<Vec<_>>();
+        let mut sessions = self
+            .load_all()?
+            .into_iter()
+            .filter(|session| session.track_id == track_id)
+            .collect::<Vec<_>>();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.completed_at_unix_ms));
         Ok(sessions)
     }
@@ -306,20 +374,27 @@ impl PracticeSessionStore {
     /// Returns the highest-accuracy session (newest wins a tie).
     pub fn best_for_track(&self, track_id: &str) -> io::Result<Option<CompletedPracticeSession>> {
         Ok(self.load_for_track(track_id)?.into_iter().max_by(|a, b| {
-            a.statistics.accuracy.total_cmp(&b.statistics.accuracy)
+            a.statistics
+                .accuracy
+                .total_cmp(&b.statistics.accuracy)
                 .then_with(|| a.completed_at_unix_ms.cmp(&b.completed_at_unix_ms))
         }))
     }
 
     fn load_file(&self) -> io::Result<SessionFile> {
-        if !self.path.exists() { return Ok(SessionFile::default()); }
+        if !self.path.exists() {
+            return Ok(SessionFile::default());
+        }
         let text = fs::read_to_string(&self.path)?;
         toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn write_file(&self, file: &SessionFile) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
-        let text = toml::to_string_pretty(file).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(&self.path, text)
     }
 }
@@ -331,7 +406,10 @@ mod tests {
 
     fn transport() -> MusicalTransport {
         MusicalTransport::new(
-            MidiTiming::Timecode { frames_per_second: 100, ticks_per_frame: 10 },
+            MidiTiming::Timecode {
+                frames_per_second: 100,
+                ticks_per_frame: 10,
+            },
             &[],
             &[],
             4_000,
@@ -424,7 +502,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("drums_history_{}_{}", std::process::id(), unique));
+        let dir =
+            std::env::temp_dir().join(format!("drums_history_{}_{}", std::process::id(), unique));
         let path = dir.join("sessions.toml");
         let store = PracticeSessionStore::new(&path);
         let first = completed();
@@ -435,15 +514,28 @@ mod tests {
         store.append(second.clone()).unwrap();
         let reopened = PracticeSessionStore::new(&path);
         assert_eq!(reopened.load_all().unwrap(), vec![first.clone(), second]);
-        assert_eq!(reopened.load_for_track("lesson.mid").unwrap(), vec![first.clone()]);
-        assert_eq!(store.append(first).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            reopened.load_for_track("lesson.mid").unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            store.append(first).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn latest_and_best_are_independent_history_queries() {
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("drums_history_summary_{}_{}", std::process::id(), unique));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "drums_history_summary_{}_{}",
+            std::process::id(),
+            unique
+        ));
         let store = PracticeSessionStore::new(dir.join("sessions.toml"));
         let mut best = completed();
         best.id = "best".into();
@@ -455,16 +547,29 @@ mod tests {
         latest.statistics.accuracy = 90.0;
         store.append(best.clone()).unwrap();
         store.append(latest.clone()).unwrap();
-        assert_eq!(store.latest_for_track("lesson.mid").unwrap().unwrap().id, "latest");
-        assert_eq!(store.best_for_track("lesson.mid").unwrap().unwrap().id, "best");
+        assert_eq!(
+            store.latest_for_track("lesson.mid").unwrap().unwrap().id,
+            "latest"
+        );
+        assert_eq!(
+            store.best_for_track("lesson.mid").unwrap().unwrap().id,
+            "best"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn corrupt_history_is_reported_not_discarded() {
-        let path = std::env::temp_dir().join(format!("drums_bad_history_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("drums_bad_history_{}.toml", std::process::id()));
         fs::write(&path, "invalid [[").unwrap();
-        assert_eq!(PracticeSessionStore::new(&path).load_all().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            PracticeSessionStore::new(&path)
+                .load_all()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         let _ = fs::remove_file(path);
     }
 }

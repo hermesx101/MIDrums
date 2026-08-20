@@ -86,6 +86,9 @@ impl MappingStore {
 
     /// Persists a configuration for its [`DrumKitConfiguration::device_name`].
     pub fn save(&self, config: &DrumKitConfiguration) -> io::Result<()> {
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::create_dir_all(&self.dir)?;
         let text = toml::to_string_pretty(config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -100,8 +103,11 @@ impl MappingStore {
             return Ok(None);
         }
         let text = fs::read_to_string(&path)?;
-        let config: DrumKitConfiguration = toml::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let config: DrumKitConfiguration =
+            toml::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         Ok(Some(config))
     }
 
@@ -119,6 +125,9 @@ impl MappingStore {
             }
             let text = fs::read_to_string(&path)?;
             if let Ok(config) = toml::from_str::<DrumKitConfiguration>(&text) {
+                if config.validate().is_err() {
+                    continue;
+                }
                 out.push(config);
             }
         }
@@ -195,12 +204,16 @@ mod tests {
             event_kind: Default::default(),
             midi_note: 49,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         config.set(DrumMapping {
             component: DrumComponent::Snare,
             event_kind: Default::default(),
             midi_note: 38,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         config
     }
@@ -240,6 +253,8 @@ mod tests {
             event_kind: Default::default(),
             midi_note: 36,
             channel: 10,
+            articulation: None,
+            cc_range: None,
         });
         let mut kit_b = sample_config("Kit B");
         kit_b.set(DrumMapping {
@@ -247,6 +262,8 @@ mod tests {
             event_kind: Default::default(),
             midi_note: 22, // different layout
             channel: 1,
+            articulation: None,
+            cc_range: None,
         });
 
         store.save(&kit_a).unwrap();
@@ -322,6 +339,49 @@ mod tests {
         fs::write(&path, "not valid toml [[").unwrap();
         let result = store.load("Broken");
         assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_aliases_and_cc_calibration_persist_together() {
+        use crate::mapping::{CcRange, MappingArticulation, MappingEventKind};
+
+        let dir = temp_dir("aliases");
+        let store = MappingStore::new(&dir);
+        let mut config = DrumKitConfiguration::new("Zone Kit");
+        for note in [51, 53, 59] {
+            config
+                .add_input(DrumMapping {
+                    component: DrumComponent::Ride,
+                    event_kind: MappingEventKind::Note,
+                    midi_note: note,
+                    channel: 10,
+                    articulation: None,
+                    cc_range: None,
+                })
+                .unwrap();
+        }
+        config
+            .add_input(DrumMapping {
+                component: DrumComponent::HiHatPedalPosition,
+                event_kind: MappingEventKind::ControlChange,
+                midi_note: 21,
+                channel: 10,
+                articulation: Some(MappingArticulation::Continuous),
+                cc_range: Some(CcRange::new(9, 122)),
+            })
+            .unwrap();
+
+        store.save(&config).unwrap();
+        let loaded = store.load("Zone Kit").unwrap().unwrap();
+        assert_eq!(loaded.mappings_for(DrumComponent::Ride).count(), 3);
+        assert_eq!(
+            loaded
+                .get(DrumComponent::HiHatPedalPosition)
+                .unwrap()
+                .cc_range,
+            Some(CcRange::new(9, 122))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

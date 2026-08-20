@@ -1,6 +1,6 @@
 //! Guided, visual setup flow over the core `SetupWizard` state machine.
 
-use drums_core::mapping::{DrumComponent, SUPPORTED_COMPONENTS, SetupWizard, SetupWizardState};
+use drums_core::mapping::{DrumComponent, SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS};
 use eframe::egui;
 
 use crate::{DrumApp, View};
@@ -25,7 +25,11 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             .add_sized([180.0, 40.0], egui::Button::new("Start Setup"))
             .clicked()
         {
-            let mut wizard = SetupWizard::new();
+            let mut wizard = app
+                .active_config
+                .clone()
+                .map(SetupWizard::with_existing)
+                .unwrap_or_default();
             wizard.start_after(app.clock.now_micros());
             app.wizard = Some(wizard);
             app.wizard_device = Some(device);
@@ -37,6 +41,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     enum Action {
         None,
         Accept,
+        AcceptAnother,
         Retry,
         Skip,
         Back,
@@ -71,10 +76,10 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             match wizard.state() {
                 SetupWizardState::Detecting(component) => {
                     component_prompt(&mut columns[1], component, false);
-                    columns[1].label(format!("Hit the {} on your kit.", component.label()));
+                    columns[1].label(component_instruction(component));
                     if component == DrumComponent::HiHatPedalPosition {
                         columns[1].weak(
-                            "This optional MIDI control is supported by some electronic drum kits. If your kit does not provide pedal-position data, choose Skip.",
+                            "Move the pedal through its complete range. The controller number and observed minimum/maximum are learned from your device. If no continuous data appears, choose Skip.",
                         );
                     } else if matches!(component, DrumComponent::HiHatOpen | DrumComponent::HiHatPedal) {
                         columns[1].weak(
@@ -86,14 +91,22 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                         columns[1].colored_label(
                             egui::Color32::from_rgb(245, 105, 100),
                             format!(
-                                "Wrong input - expected {}, detected {}",
-                                component.label(),
-                                detected.label()
+                                "This MIDI input is already assigned to {}. Try again for {}.",
+                                detected.label(),
+                                component.label()
                             ),
                         );
                         columns[1].monospace(format!(
-                            "Note {} | Channel {} | Velocity {}",
-                            hit.midi_note, hit.channel, hit.velocity
+                            "{} {} | Channel {} | {} {}",
+                            hit.event_kind.label(),
+                            hit.midi_note,
+                            hit.channel,
+                            if hit.event_kind == drums_core::mapping::MappingEventKind::Note {
+                                "Velocity"
+                            } else {
+                                "Value"
+                            },
+                            hit.velocity
                         ));
                     }
                     columns[1].spinner();
@@ -114,12 +127,59 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                             if hit.event_kind == drums_core::mapping::MappingEventKind::Note { "Velocity" } else { "Value" },
                             hit.velocity
                         ));
+                        if let Some(range) = wizard.cc_range() {
+                            columns[1].monospace(format!(
+                                "Observed range: {}–{}",
+                                range.min, range.max
+                            ));
+                            columns[1].weak(
+                                "Continue moving fully open and closed, then confirm.",
+                            );
+                        }
+                    }
+                    if !wizard.conflicting_hits().is_empty() {
+                        columns[1].colored_label(
+                            egui::Color32::from_rgb(240, 190, 80),
+                            "Additional MIDI inputs arrived with this action.",
+                        );
+                        for conflict in wizard.conflicting_hits() {
+                            columns[1].monospace(format!(
+                                "Ignored candidate: {} {} | Channel {} | Value {}",
+                                conflict.event_kind.label(),
+                                conflict.midi_note,
+                                conflict.channel,
+                                conflict.velocity
+                            ));
+                        }
+                        columns[1].weak(
+                            "Confirm only the primary input, or Try Again if this was not intentional.",
+                        );
                     }
                 }
                 SetupWizardState::Completed => {
-                    columns[1].heading("SETUP COMPLETE");
+                    columns[1].heading("TEST YOUR DRUM KIT");
                     columns[1].label(format!("{} / {} components configured", wizard.done_count(), SUPPORTED_COMPONENTS.len()));
                     columns[1].label(format!("Connected device: {device}"));
+                    columns[1].weak("Hit any drum to verify the saved logical assignment before continuing.");
+                    if let Some(hit) = wizard.test_hit() {
+                        columns[1].monospace(format!(
+                            "Detected: {} {} | Channel {} | Value {}",
+                            hit.event_kind.label(), hit.midi_note, hit.channel, hit.velocity
+                        ));
+                        columns[1].strong(format!(
+                            "Mapped to: {}",
+                            wizard.test_component().map(DrumComponent::label).unwrap_or("UNKNOWN")
+                        ));
+                    } else {
+                        columns[1].spinner();
+                        columns[1].strong("Waiting for test input...");
+                    }
+                    if !wizard.has_usable_mapping() {
+                        columns[1].colored_label(
+                            egui::Color32::from_rgb(240, 190, 80),
+                            "At least one playable drum input is required. Go Back to configure one.",
+                        );
+                    }
                 }
                 SetupWizardState::Intro | SetupWizardState::Canceled => {}
             }
@@ -141,8 +201,14 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                 }
             }
             SetupWizardState::Confirming(_) => {
-                if big_button_enabled(ui, "Accept / Continue", true) {
+                if big_button_enabled(ui, "Accept / Continue", wizard.can_accept()) {
                     action = Action::Accept;
+                }
+                if wizard.detected_hit().is_some_and(|hit| {
+                    hit.event_kind == drums_core::mapping::MappingEventKind::Note
+                }) && big_button(ui, "Use + Add Another")
+                {
+                    action = Action::AcceptAnother;
                 }
                 if big_button(ui, "Reassign / Retry") {
                     action = Action::Retry;
@@ -158,8 +224,11 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                 }
             }
             SetupWizardState::Completed => {
-                if big_button(ui, "Done - Save Mapping") {
+                if big_button_enabled(ui, "Done - Save Mapping", wizard.has_usable_mapping()) {
                     action = Action::Finish;
+                }
+                if big_button(ui, "Back") {
+                    action = Action::Back;
                 }
                 if big_button(ui, "Cancel") {
                     action = Action::Cancel;
@@ -171,6 +240,12 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     match action {
         Action::Accept => {
             app.wizard.as_mut().unwrap().accept();
+            let boundary = app.clock.now_micros();
+            app.wizard.as_mut().unwrap().begin_step_after(boundary);
+            app.wizard_last_input = None;
+        }
+        Action::AcceptAnother => {
+            app.wizard.as_mut().unwrap().accept_and_add_another();
             let boundary = app.clock.now_micros();
             app.wizard.as_mut().unwrap().begin_step_after(boundary);
             app.wizard_last_input = None;
@@ -197,7 +272,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             app.wizard = None;
             app.wizard_device = None;
             app.wizard_last_input = None;
-            app.view = View::Monitor;
+            app.view = View::TrackLibrary;
         }
         Action::Finish => finish_wizard(app, &device),
         Action::None => {}
@@ -222,10 +297,10 @@ fn progress_list(ui: &mut egui::Ui, wizard: &SetupWizard) {
         .show(ui, |ui| {
             ui.strong("PROGRESS");
             for component in SUPPORTED_COMPONENTS {
-                let prefix = if wizard.is_done(component) {
-                    "DONE"
-                } else if wizard.current_component() == Some(component) {
+                let prefix = if wizard.current_component() == Some(component) {
                     "CURRENT"
+                } else if wizard.is_done(component) {
+                    "DONE"
                 } else {
                     "PENDING"
                 };
@@ -241,7 +316,29 @@ fn progress_list(ui: &mut egui::Ui, wizard: &SetupWizard) {
 
 fn component_prompt(ui: &mut egui::Ui, component: DrumComponent, _active: bool) {
     ui.weak("CONFIGURE");
-    ui.heading(egui::RichText::new(component.label()).size(30.0));
+    ui.heading(egui::RichText::new(component.instrument_label()).size(30.0));
+    if let Some(state) = component.state_label() {
+        let step = match component {
+            DrumComponent::HiHat => "Step 1 of 4",
+            DrumComponent::HiHatOpen => "Step 2 of 4",
+            DrumComponent::HiHatPedal => "Step 3 of 4",
+            DrumComponent::HiHatPedalPosition => "Step 4 of 4 · Optional",
+            _ => "",
+        };
+        ui.strong(format!("{state}  {step}"));
+    }
+}
+
+fn component_instruction(component: DrumComponent) -> String {
+    match component {
+        DrumComponent::HiHat => "Close the hi-hat and strike it normally.".into(),
+        DrumComponent::HiHatOpen => "Open the hi-hat and strike it normally.".into(),
+        DrumComponent::HiHatPedal => "Press the hi-hat pedal for a foot hit.".into(),
+        DrumComponent::HiHatPedalPosition => {
+            "Move the hi-hat pedal from fully open to fully closed.".into()
+        }
+        _ => format!("Hit the {} on your kit.", component.label()),
+    }
 }
 
 fn last_input_panel(
@@ -373,20 +470,29 @@ fn big_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
 }
 
 fn finish_wizard(app: &mut DrumApp, device: &str) {
-    if let Some(config) = app.wizard.as_mut().and_then(|wizard| wizard.finish(device)) {
-        match app.store.save(&config) {
-            Ok(()) => {
-                app.status = format!(
-                    "Mapping saved for {device}: {} components configured.",
-                    config.mapped_count()
-                );
-                app.active_config = Some(config);
-            }
-            Err(error) => app.status = format!("Failed to save mapping: {error}"),
-        }
+    let Some(config) = app
+        .wizard
+        .as_ref()
+        .and_then(|wizard| wizard.configuration(device))
+    else {
+        return;
+    };
+    if let Err(error) = app.store.save(&config) {
+        app.status = format!("Failed to save mapping: {error}");
+        return;
     }
+    if let Some(wizard) = app.wizard.as_mut() {
+        let _ = wizard.finish(device);
+    }
+    app.status = format!(
+        "Mapping saved for {device}: {} drums / {} inputs configured.",
+        config.mapped_component_count(),
+        config.mapped_count()
+    );
+    app.active_config = Some(config);
     app.wizard = None;
     app.wizard_device = None;
     app.wizard_last_input = None;
-    app.view = View::Monitor;
+    app.mapping_draft = None;
+    app.view = View::TrackLibrary;
 }

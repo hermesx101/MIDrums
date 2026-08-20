@@ -1,12 +1,19 @@
 //! Phase 3A MIDI-file inspection view. Parsing remains in `drums-core`.
 
-use crate::{DrumApp, LibrarySort, PracticeLoopMode, View};
+use crate::{DrumApp, LibrarySort, PracticeLoopMode, PracticeVisual, View};
 use drums_core::{
-    DrumComponent, ExpectedNote, MidiFile, MidiTiming, MusicalTransport, PracticePerformance,
-    PracticeResult, PracticeResultKind, Subdivision, TargetState, TimingJudgment, TimingTendency,
-    TransportState, count_tokens,
+    count_tokens, DrumComponent, ExpectedNote, MidiFile, MidiTiming, MusicalTransport,
+    PracticePerformance, PracticeResult, PracticeResultKind, Subdivision, TargetState,
+    TimingJudgment, TimingTendency, TransportState,
 };
 use eframe::egui;
+
+const RESULT_CORRECT: egui::Color32 = egui::Color32::from_rgb(72, 214, 137);
+const RESULT_EARLY: egui::Color32 = egui::Color32::from_rgb(244, 196, 70);
+const RESULT_LATE: egui::Color32 = egui::Color32::from_rgb(246, 132, 68);
+const RESULT_WRONG_DRUM: egui::Color32 = egui::Color32::from_rgb(244, 82, 118);
+const RESULT_MISSED: egui::Color32 = egui::Color32::from_rgb(120, 124, 135);
+const RESULT_EXTRA: egui::Color32 = egui::Color32::from_rgb(165, 105, 220);
 
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
@@ -41,20 +48,6 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
                 }
             });
     });
-    if !app.connected {
-        egui::Frame::group(ui.style())
-            .inner_margin(10.0)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("NO MIDI DEVICE CONNECTED");
-                    ui.label("You can still import, browse, and select tracks.");
-                    if ui.button("Refresh Devices").clicked() {
-                        app.refresh_devices();
-                    }
-                });
-            });
-    }
-
     if app.track_library.is_empty() {
         ui.add_space(30.0);
         ui.vertical_centered(|ui| {
@@ -92,19 +85,21 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     });
     let mut practice_path = None;
     let mut analysis_path = None;
+    let mut sheet_path = None;
     let mut rename = None;
     let mut remove = None;
     for entry in &entries {
         ui.push_id(("track_row", &entry.path), |ui| {
             // Bound only the horizontal dimension. Height remains entirely
             // content-driven, and the page-level ScrollArea handles overflow.
-            ui.set_width(ui.available_width().min(980.0));
+            ui.set_width(ui.available_width());
             library_card(
                 app,
                 ui,
                 entry,
                 &mut practice_path,
                 &mut analysis_path,
+                &mut sheet_path,
                 &mut rename,
                 &mut remove,
             );
@@ -130,6 +125,11 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
         app.analysis_session_id = None;
         app.view = View::PerformanceAnalysis;
     }
+    if let Some(path) = sheet_path {
+        if let Err(error) = app.open_sheet_music(&path) {
+            app.midi_import_error = Some(error);
+        }
+    }
     library_edit_prompts(app, ui);
 }
 
@@ -139,6 +139,7 @@ fn library_card(
     entry: &crate::track_library::LibraryEntry,
     practice_path: &mut Option<String>,
     analysis_path: &mut Option<String>,
+    sheet_path: &mut Option<String>,
     rename: &mut Option<(String, String)>,
     remove: &mut Option<String>,
 ) {
@@ -160,7 +161,7 @@ fn library_card(
         ))
         .inner_margin(12.0)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width().min(956.0));
+            ui.set_width(ui.available_width());
 
             ui.horizontal(|ui| {
                 let title_width = (ui.available_width() - 42.0).max(80.0);
@@ -174,7 +175,15 @@ fn library_card(
                     app.library_selected_path = Some(entry.path.clone());
                 }
                 title.on_hover_text("Select track");
-                library_card_menu(ui, entry, practice_path, analysis_path, rename, remove);
+                library_card_menu(
+                    ui,
+                    entry,
+                    practice_path,
+                    analysis_path,
+                    sheet_path,
+                    rename,
+                    remove,
+                );
             });
 
             ui.add_space(6.0);
@@ -199,13 +208,19 @@ fn library_card(
                 if entry.likely_drums {
                     ui.colored_label(egui::Color32::from_rgb(225, 185, 75), "LIKELY DRUMS");
                 }
-                let history = app.session_store.load_for_track(&entry.path).unwrap_or_default();
+                let history = app
+                    .session_store
+                    .load_for_track(&entry.path)
+                    .unwrap_or_default();
                 if let Some(latest) = history.first() {
                     ui.colored_label(
                         egui::Color32::from_rgb(90, 210, 135),
                         format!("Last: {:.1}%", latest.statistics.accuracy),
                     );
-                    if let Some(best) = history.iter().max_by(|a, b| a.statistics.accuracy.total_cmp(&b.statistics.accuracy)) {
+                    if let Some(best) = history
+                        .iter()
+                        .max_by(|a, b| a.statistics.accuracy.total_cmp(&b.statistics.accuracy))
+                    {
                         ui.weak(format!("Best: {:.1}%", best.statistics.accuracy));
                     }
                     ui.weak(format!("Sessions: {}", history.len()));
@@ -224,6 +239,9 @@ fn library_card(
                 }
                 if ui.button("Performance Analysis").clicked() {
                     *analysis_path = Some(entry.path.clone());
+                }
+                if ui.button("Sheet Music").clicked() {
+                    *sheet_path = Some(entry.path.clone());
                 }
                 egui::CollapsingHeader::new("Details")
                     .default_open(false)
@@ -254,6 +272,7 @@ fn library_card_menu(
     entry: &crate::track_library::LibraryEntry,
     practice_path: &mut Option<String>,
     analysis_path: &mut Option<String>,
+    sheet_path: &mut Option<String>,
     rename: &mut Option<(String, String)>,
     remove: &mut Option<String>,
 ) {
@@ -264,6 +283,10 @@ fn library_card_menu(
         }
         if ui.button("Performance Analysis").clicked() {
             *analysis_path = Some(entry.path.clone());
+            ui.close_menu();
+        }
+        if ui.button("Sheet Music").clicked() {
+            *sheet_path = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Rename").clicked() {
@@ -338,7 +361,7 @@ fn library_edit_prompts(app: &mut DrumApp, ui: &mut egui::Ui) {
 #[allow(dead_code)]
 fn show_card_legacy(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_centered(|ui| {
         ui.heading("TRACK LIBRARY");
         if ui.button("+ Import MIDI").clicked() {
             app.import_midi_clicked();
@@ -527,15 +550,23 @@ pub fn show_practice(app: &mut DrumApp, ui: &mut egui::Ui) {
         }
         return;
     };
-    if !app.connected {
-        ui.colored_label(
-            egui::Color32::from_rgb(240, 190, 80),
-            "MIDI DEVICE DISCONNECTED - connect a device for live drum input.",
-        );
-    }
     let expected = file.expected_notes_for_track(track, app.active_config.as_ref());
-    backing_audio_controls(app, ui);
     practice_interface(app, ui, &expected);
+}
+
+pub fn show_practice_persistent_header(app: &mut DrumApp, ui: &mut egui::Ui) {
+    if app.imported_midi.is_some() && app.selected_drum_track.is_some() {
+        practice_header(app, ui);
+    }
+}
+
+pub fn show_practice_sheet_content(app: &mut DrumApp, ui: &mut egui::Ui) {
+    let (Some(file), Some(track)) = (&app.imported_midi, app.selected_drum_track) else {
+        ui.label("No track selected");
+        return;
+    };
+    let expected = file.expected_notes_for_track(track, app.active_config.as_ref());
+    practice_content(app, ui, &expected);
 }
 
 fn backing_audio_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
@@ -552,35 +583,84 @@ fn backing_audio_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
             choose_audio = ui.button("Add Backing Track").clicked();
             return;
         }
-        ui.label(app.backing_audio.path().and_then(|p| p.file_name()).and_then(|p| p.to_str()).unwrap_or("Audio"));
-        if ui.small_button("Play").clicked() { app.backing_audio.play(); }
-        if ui.small_button("Pause").clicked() { app.backing_audio.pause(); }
-        if ui.small_button("Stop").clicked() { app.backing_audio.stop(); seek = 0.0; }
+        ui.label(
+            app.backing_audio
+                .path()
+                .and_then(|p| p.file_name())
+                .and_then(|p| p.to_str())
+                .unwrap_or("Audio"),
+        );
+        if ui.small_button("Play").clicked() {
+            app.backing_audio.play();
+        }
+        if ui.small_button("Pause").clicked() {
+            app.backing_audio.pause();
+        }
+        if ui.small_button("Stop").clicked() {
+            app.backing_audio.stop();
+            seek = 0.0;
+        }
         ui.monospace(format!("{} / {}", time_text(seek), time_text(duration)));
-        seek_changed = ui.add_sized([220.0, 20.0], egui::Slider::new(&mut seek, 0.0..=duration.max(0.001)).show_value(false).text("Seek")).changed();
+        seek_changed = ui
+            .add_sized(
+                [220.0, 20.0],
+                egui::Slider::new(&mut seek, 0.0..=duration.max(0.001))
+                    .show_value(false)
+                    .text("Seek"),
+            )
+            .changed();
         let mut volume = app.backing_audio.volume();
-        if ui.add_sized([135.0, 20.0], egui::Slider::new(&mut volume, 0.0..=1.0).text("Volume")).changed() { app.backing_audio.set_volume(volume); }
+        if ui
+            .add_sized(
+                [135.0, 20.0],
+                egui::Slider::new(&mut volume, 0.0..=1.0).text("Volume"),
+            )
+            .changed()
+        {
+            app.backing_audio.set_volume(volume);
+        }
         let mut muted = app.backing_audio.muted();
-        if ui.checkbox(&mut muted, "Mute").changed() { app.backing_audio.set_muted(muted); }
-        if ui.checkbox(&mut app.start_audio_with_practice, "Start audio with practice").changed() { app.save_practice_settings(); }
+        if ui.checkbox(&mut muted, "Mute").changed() {
+            app.backing_audio.set_muted(muted);
+        }
+        if ui
+            .checkbox(
+                &mut app.start_audio_with_practice,
+                "Start audio with practice",
+            )
+            .changed()
+        {
+            app.save_practice_settings();
+        }
         choose_audio = ui.small_button("Replace Audio").clicked();
         remove_audio = ui.small_button("Remove Audio").clicked();
     });
-    if loaded && app.transport.as_ref().is_some_and(|t| (t.practice_starting_bpm() - t.original_bpm()).abs() > 0.1) {
-        ui.weak("Backing audio remains at its original speed while Practice BPM differs.");
-    }
-    ui.separator();
     if seek_changed {
         let _ = app.backing_audio.seek(seek);
         if let Some(transport) = app.transport.as_mut() {
             let midi_seconds = (seek - app.audio_sync_offset_ms / 1_000.0).max(0.0);
-            transport.seek(transport.effective_tick_at_seconds(midi_seconds).min(i64::MAX as u64) as i64);
-            if let Some(session) = app.practice_session.as_mut() { session.on_seek_to_tick(transport.current_tick(), transport); }
+            transport.seek(
+                transport
+                    .effective_tick_at_seconds(midi_seconds)
+                    .min(i64::MAX as u64) as i64,
+            );
+            if let Some(session) = app.practice_session.as_mut() {
+                session.on_seek_to_tick(transport.current_tick(), transport);
+            }
         }
     }
-    if remove_audio { app.backing_audio.unload(); app.status = "Backing audio removed from the current practice context.".into(); }
+    if remove_audio {
+        app.backing_audio.unload();
+        app.status = "Backing audio removed from the current practice context.".into();
+    }
     if choose_audio {
-        let Some(path) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "wav", "ogg", "flac"]).set_title("Choose backing track").pick_file() else { return; };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
+            .set_title("Choose backing track")
+            .pick_file()
+        else {
+            return;
+        };
         match app.backing_audio.load(path) {
             Ok(()) => app.status = "Backing audio loaded for the current practice.".into(),
             Err(error) => app.status = format!("Could not load audio file. Reason: {error}"),
@@ -591,19 +671,13 @@ fn backing_audio_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
 /// Phase 5A practice composition. Musical state remains owned by drums-core;
 /// this function only arranges controls and renders a bounded view of it.
 fn practice_interface(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[ExpectedNote]) {
-    let Some(transport) = app.transport.as_ref() else {
-        return;
-    };
-    let song_complete = app.practice_session.as_ref().is_some_and(|session| {
-        session.matchable_count() > 0
-            && session.finalized_matchable_count() == session.matchable_count()
-            && session
-                .current_target(transport.current_tick(), transport)
-                .is_none()
-    });
+    practice_header(app, ui);
+    practice_content(app, ui, expected);
+}
 
+fn practice_header(app: &mut DrumApp, ui: &mut egui::Ui) {
     practice_top_bar(app, ui);
-    ui.add_space(6.0);
+    ui.add_space(10.0);
 
     if app.count_in_active {
         if let Some(transport) = app.transport.as_ref() {
@@ -642,6 +716,30 @@ fn practice_interface(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[Expected
             });
         }
     }
+    practice_feedback_bar(app, ui);
+    ui.add_space(6.0);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            backing_audio_controls(app, ui)
+        });
+    ui.add_space(6.0);
+    practice_metronome_strip(app, ui);
+    ui.add_space(4.0);
+}
+
+fn practice_content(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[ExpectedNote]) {
+    let Some(transport) = app.transport.as_ref() else {
+        return;
+    };
+    let song_complete = app.practice_session.as_ref().is_some_and(|session| {
+        session.matchable_count() > 0
+            && session.finalized_matchable_count() == session.matchable_count()
+            && session
+                .current_target(transport.current_tick(), transport)
+                .is_none()
+    });
 
     if song_complete {
         // A final hit can complete the session before the transport reaches its
@@ -673,23 +771,117 @@ fn practice_interface(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[Expected
     }
 
     if let Some(transport) = app.transport.as_ref() {
-        show_visual_legend(ui);
-        rhythm_grid(
-            ui,
-            transport,
-            expected,
-            app.practice_session
-                .as_ref()
-                .map(|session| session.results())
-                .unwrap_or(&[]),
-            app.metronome.subdivision(),
-            app.practice_lookahead_seconds,
-            app.active_loop_region(),
-        );
+        let results = app
+            .practice_session
+            .as_ref()
+            .map(|session| session.results())
+            .unwrap_or(&[]);
+        match app.practice_visual {
+            PracticeVisual::Timeline => {
+                rhythm_grid(
+                    ui,
+                    transport,
+                    expected,
+                    results,
+                    app.metronome.subdivision(),
+                    app.practice_lookahead_seconds,
+                    app.active_loop_region(),
+                );
+            }
+            PracticeVisual::SheetMusic => {
+                if ui.input(|input| input.raw_scroll_delta.y.abs() > 0.1) {
+                    app.notation_follow_suspended_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                }
+                let follow = app.notation_follow_playback
+                    && app
+                        .notation_follow_suspended_until
+                        .is_none_or(|until| std::time::Instant::now() >= until);
+                if let Some(score) = app.notation_score.as_ref() {
+                    crate::notation_ui::show_practice_score(
+                        ui,
+                        score,
+                        transport.current_tick(),
+                        results,
+                        follow,
+                        app.notation_zoom,
+                    )
+                } else {
+                    ui.label("Sheet music is unavailable for this MIDI timing format.");
+                }
+            }
+        }
     }
-
-    practice_feedback_bar(app, ui);
     practice_debug_details(app, ui);
+}
+
+fn practice_metronome_strip(app: &mut DrumApp, ui: &mut egui::Ui) {
+    let Some(transport) = app.transport.as_ref() else {
+        return;
+    };
+    let subdivision = app.metronome.subdivision();
+    let tokens = count_tokens(
+        transport.position_map(),
+        transport.current_tick(),
+        subdivision,
+    );
+    ui.horizontal(|ui| {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(18, 27, 37))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("METRONOME");
+                    let toggle = if app.metronome_enabled { "ON" } else { "OFF" };
+                    ui.checkbox(&mut app.metronome_enabled, toggle);
+                    ui.weak(subdivision_long_label(subdivision));
+                    ui.separator();
+                    for token in &tokens {
+                        let color = if token.active {
+                            egui::Color32::from_rgb(105, 220, 255)
+                        } else {
+                            egui::Color32::from_gray(165)
+                        };
+                        ui.colored_label(
+                            color,
+                            egui::RichText::new(&token.label)
+                                .strong()
+                                .size(if token.active { 18.0 } else { 16.0 }),
+                        );
+                    }
+                });
+            });
+        if app.practice_visual == PracticeVisual::SheetMusic {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.weak("SHEET MUSIC");
+            if ui.small_button("−").clicked() {
+                app.notation_zoom = (app.notation_zoom - 0.1).max(0.7);
+            }
+            ui.weak(format!("Zoom {:.0}%", app.notation_zoom * 100.0));
+            if ui.small_button("+").clicked() {
+                app.notation_zoom = (app.notation_zoom + 0.1).min(2.0);
+            }
+            ui.checkbox(&mut app.notation_follow_playback, "Follow Playback");
+        }
+    });
+}
+
+fn timeline_label_width(total_width: f32) -> f32 {
+    total_width.clamp(110.0, 155.0) * 0.85
+}
+
+struct TimelineHorizontalGeometry {
+    grid_left: f32,
+    beat_origin: f32,
+}
+
+fn timeline_horizontal_geometry(rect: egui::Rect) -> TimelineHorizontalGeometry {
+    let grid_left = rect.left() + timeline_label_width(rect.width());
+    TimelineHorizontalGeometry {
+        grid_left,
+        beat_origin: grid_left + (rect.right() - grid_left) * 0.20,
+    }
 }
 
 fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
@@ -707,8 +899,21 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
     let song_name = app
         .imported_midi
         .as_ref()
-        .map(|file| file.filename.as_str())
-        .unwrap_or("MIDI Practice");
+        .map(|file| file.filename.clone())
+        .unwrap_or_else(|| "MIDI Practice".into());
+    let track_meta = app
+        .imported_midi
+        .as_ref()
+        .map(|file| {
+            let (n, d) = transport.position_map().time_signature_at_tick(0);
+            let notes = app
+                .selected_drum_track
+                .and_then(|i| file.tracks.get(i))
+                .map(|t| t.note_event_count)
+                .unwrap_or(0);
+            format!("{n}/{d}  •  {}  •  {notes} notes", time_text(total))
+        })
+        .unwrap_or_default();
 
     let mut play = false;
     let mut go_to_tracks = false;
@@ -731,182 +936,217 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
         .position_at_tick(final_tick)
         .measure;
     let mut custom_changed = false;
+    let count_display_tokens = count_tokens(transport.position_map(), current_tick, subdivision);
 
     egui::Frame::group(ui.style())
         .inner_margin(10.0)
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                go_to_tracks = ui.button("Your Tracks").clicked();
-                ui.strong(song_name);
-                ui.separator();
-                beginning = ui.button("|<").on_hover_text("Go to beginning").clicked();
-                play = ui
-                    .add_enabled(state != TransportState::Playing, egui::Button::new(">"))
-                    .on_hover_text("Play / resume")
-                    .clicked();
-                pause = ui
-                    .add_enabled(state == TransportState::Playing, egui::Button::new("||"))
-                    .on_hover_text("Pause")
-                    .clicked();
-                stop = ui.button("[]").on_hover_text("Stop").clicked();
-                end = ui.button(">|").on_hover_text("Go to end").clicked();
-                ui.separator();
-                ui.monospace(format!("{} / {}", time_text(elapsed), time_text(total)));
-                ui.weak(format!("Bar {}  Beat {}", musical.measure, musical.beat));
-            });
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.weak("PRACTICE BPM");
-                bpm_delta -= ui.button("-").clicked() as u8 as f64;
-                manual_bpm_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut manual_bpm)
-                            .range(20.0..=300.0)
-                            .speed(1.0)
-                            .suffix(" BPM"),
-                    )
-                    .changed();
-                bpm_delta += ui.button("+").clicked() as u8 as f64;
-                reset_bpm = ui.small_button("Reset").clicked();
-                ui.weak(format!("Original {original_bpm:.0} BPM"));
-                ui.separator();
-                ui.strong("SUBDIVISION");
-                egui::ComboBox::from_id_salt("top_subdivision")
-                    .selected_text(if subdivision_auto {
-                        format!("Auto ({})", subdivision_long_label(subdivision))
-                    } else {
-                        subdivision_long_label(subdivision).to_string()
-                    })
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(subdivision_auto, "Auto").clicked() {
-                            subdivision_auto = true;
-                            subdivision_changed = true;
-                            if let Some(suggestion) = app.subdivision_suggestion {
-                                subdivision = suggestion.subdivision;
-                            }
-                        }
-                        for value in [
-                            Subdivision::Quarter,
-                            Subdivision::Eighth,
-                            Subdivision::Sixteenth,
-                        ] {
-                            if ui
-                                .selectable_label(
-                                    !subdivision_auto && subdivision == value,
-                                    subdivision_long_label(value),
-                                )
-                                .clicked()
-                            {
-                                subdivision_auto = false;
-                                subdivision = value;
-                                subdivision_changed = true;
-                            }
-                        }
-                    });
-                ui.strong("METRONOME");
-                let metronome_label = if app.metronome_enabled { "ON" } else { "OFF" };
-                ui.checkbox(&mut app.metronome_enabled, metronome_label);
-                ui.strong("COUNT-IN");
-                egui::ComboBox::from_id_salt("count_in")
-                    .selected_text(if app.count_in_bars == 0 {
-                        "Off".to_string()
-                    } else {
-                        format!(
-                            "{} Bar{}",
-                            app.count_in_bars,
-                            if app.count_in_bars == 1 { "" } else { "s" }
-                        )
-                    })
-                    .show_ui(ui, |ui| {
-                        for bars in [0, 1, 2, 4, 8] {
-                            ui.selectable_value(
-                                &mut app.count_in_bars,
-                                bars,
-                                if bars == 0 {
-                                    "Off".to_string()
-                                } else {
-                                    format!("{bars} Bar{}", if bars == 1 { "" } else { "s" })
-                                },
-                            );
-                        }
-                    });
-                ui.strong("LOOKAHEAD");
-                egui::ComboBox::from_id_salt("lookahead")
-                    .selected_text(format!("{:.0} sec", app.practice_lookahead_seconds))
-                    .show_ui(ui, |ui| {
-                        for seconds in [1.0, 2.0, 4.0, 6.0, 8.0] {
-                            ui.selectable_value(
-                                &mut app.practice_lookahead_seconds,
-                                seconds,
-                                format!("{seconds:.0} sec"),
-                            );
-                        }
-                    });
-                ui.strong("LOOP");
-                egui::ComboBox::from_id_salt("practice_loop")
-                    .selected_text(loop_mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            PracticeLoopMode::Off,
-                            PracticeLoopMode::CurrentBar,
-                            PracticeLoopMode::TwoBars,
-                            PracticeLoopMode::FourBars,
-                            PracticeLoopMode::EightBars,
-                            PracticeLoopMode::Custom,
-                        ] {
-                            loop_changed |= ui
-                                .selectable_value(&mut loop_mode, mode, mode.label())
-                                .changed();
-                        }
-                    });
-                if loop_mode == PracticeLoopMode::Custom {
-                    ui.label("Start bar");
-                    custom_changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut app.practice_loop_start_bar)
-                                .range(1..=last_bar.max(1)),
-                        )
-                        .changed();
-                    ui.label("End bar");
-                    custom_changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut app.practice_loop_end_bar)
-                                .range(2..=last_bar + 1),
-                        )
-                        .changed();
-                }
-                if app.practice_loop_mode != PracticeLoopMode::Off {
-                    ui.weak(format!(
-                        "Bars {} -> {} | Loop {}",
-                        app.practice_loop_start_bar,
-                        app.practice_loop_end_bar,
-                        app.practice_loop_iteration
-                    ));
-                }
-            });
-            let tokens = count_tokens(transport.position_map(), current_tick, subdivision);
-            ui.horizontal(|ui| {
-                ui.weak(if app.count_in_active {
-                    "COUNT-IN"
-                } else {
-                    "COUNT"
-                });
-                for token in tokens {
-                    if token.active {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(120, 205, 255),
-                            egui::RichText::new(token.label).strong().size(17.0),
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        go_to_tracks = ui.small_button("← Library").clicked();
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&song_name).strong().size(17.0))
+                                .truncate(),
                         );
-                    } else {
-                        ui.label(egui::RichText::new(token.label).size(15.0));
+                        ui.weak(&track_meta);
+                    });
+                    ui.horizontal(|ui| {
+                        beginning = ui.button("|<").on_hover_text("Go to beginning").clicked();
+                        play = ui
+                            .add_enabled(state != TransportState::Playing, egui::Button::new(">"))
+                            .on_hover_text("Play / resume")
+                            .clicked();
+                        pause = ui
+                            .add_enabled(state == TransportState::Playing, egui::Button::new("||"))
+                            .on_hover_text("Pause")
+                            .clicked();
+                        stop = ui.button("[]").on_hover_text("Stop").clicked();
+                        end = ui.button(">|").on_hover_text("Go to end").clicked();
+                        ui.monospace(format!("{} / {}", time_text(elapsed), time_text(total)));
+                        ui.weak(format!("Bar {}  Beat {}", musical.measure, musical.beat));
+                    });
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("PRACTICE BPM");
+                    ui.horizontal(|ui| {
+                        bpm_delta -= ui.button("−").clicked() as u8 as f64;
+                        manual_bpm_changed |= ui
+                            .add_sized(
+                                [88.0, 30.0],
+                                egui::DragValue::new(&mut manual_bpm)
+                                    .range(20.0..=300.0)
+                                    .speed(1.0)
+                                    .suffix(" BPM"),
+                            )
+                            .changed();
+                        bpm_delta += ui.button("+").clicked() as u8 as f64;
+                        reset_bpm = ui.small_button("Reset").clicked();
+                    });
+                    ui.small(format!("Original {original_bpm:.0} BPM"));
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("SUBDIVISION");
+                    egui::ComboBox::from_id_salt("top_subdivision")
+                        .width(150.0)
+                        .selected_text(if subdivision_auto {
+                            format!("Auto ({})", subdivision_long_label(subdivision))
+                        } else {
+                            subdivision_long_label(subdivision).to_string()
+                        })
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(subdivision_auto, "Auto").clicked() {
+                                subdivision_auto = true;
+                                subdivision_changed = true;
+                                if let Some(s) = app.subdivision_suggestion {
+                                    subdivision = s.subdivision;
+                                }
+                            }
+                            for value in [
+                                Subdivision::Quarter,
+                                Subdivision::Eighth,
+                                Subdivision::Sixteenth,
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        !subdivision_auto && subdivision == value,
+                                        subdivision_long_label(value),
+                                    )
+                                    .clicked()
+                                {
+                                    subdivision_auto = false;
+                                    subdivision = value;
+                                    subdivision_changed = true;
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("COUNT-IN");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("count_in")
+                            .width(58.0)
+                            .selected_text(if app.count_in_bars == 0 {
+                                "Off".to_string()
+                            } else {
+                                format!(
+                                    "{} Bar{}",
+                                    app.count_in_bars,
+                                    if app.count_in_bars == 1 { "" } else { "s" }
+                                )
+                            })
+                            .show_ui(ui, |ui| {
+                                for bars in [0, 1, 2, 4, 8] {
+                                    ui.selectable_value(
+                                        &mut app.count_in_bars,
+                                        bars,
+                                        if bars == 0 {
+                                            "Off".to_string()
+                                        } else {
+                                            format!(
+                                                "{bars} Bar{}",
+                                                if bars == 1 { "" } else { "s" }
+                                            )
+                                        },
+                                    );
+                                }
+                            });
+                        let mut count_enabled = app.count_in_bars > 0;
+                        if ui.checkbox(&mut count_enabled, "Enabled").changed() {
+                            app.count_in_bars = if count_enabled { 1 } else { 0 };
+                        }
+                    });
+                    if app.count_in_active {
+                        ui.horizontal(|ui| {
+                            for token in &count_display_tokens {
+                                if token.active {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(120, 205, 255),
+                                        egui::RichText::new(&token.label).strong(),
+                                    );
+                                } else {
+                                    ui.label(&token.label);
+                                }
+                            }
+                        });
                     }
-                }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("LOOKAHEAD");
+                    egui::ComboBox::from_id_salt("lookahead")
+                        .width(72.0)
+                        .selected_text(format!("{:.0} sec", app.practice_lookahead_seconds))
+                        .show_ui(ui, |ui| {
+                            for seconds in [1.0, 2.0, 4.0, 6.0, 8.0] {
+                                ui.selectable_value(
+                                    &mut app.practice_lookahead_seconds,
+                                    seconds,
+                                    format!("{seconds:.0} sec"),
+                                );
+                            }
+                        });
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("LOOP");
+                    egui::ComboBox::from_id_salt("practice_loop")
+                        .width(72.0)
+                        .selected_text(loop_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                PracticeLoopMode::Off,
+                                PracticeLoopMode::CurrentBar,
+                                PracticeLoopMode::TwoBars,
+                                PracticeLoopMode::FourBars,
+                                PracticeLoopMode::EightBars,
+                                PracticeLoopMode::Custom,
+                            ] {
+                                loop_changed |= ui
+                                    .selectable_value(&mut loop_mode, mode, mode.label())
+                                    .changed();
+                            }
+                        });
+                    if loop_mode == PracticeLoopMode::Custom {
+                        ui.horizontal(|ui| {
+                            ui.label("Bars");
+                            custom_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut app.practice_loop_start_bar)
+                                        .range(1..=last_bar.max(1)),
+                                )
+                                .changed();
+                            custom_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut app.practice_loop_end_bar)
+                                        .range(2..=last_bar + 1),
+                                )
+                                .changed();
+                        });
+                    } else if app.practice_loop_mode != PracticeLoopMode::Off {
+                        ui.weak(format!(
+                            "{}–{} · {}",
+                            app.practice_loop_start_bar,
+                            app.practice_loop_end_bar,
+                            app.practice_loop_iteration
+                        ));
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.weak("SEEK");
+                    ui.add_sized(
+                        [125.0, 28.0],
+                        egui::Slider::new(&mut seek_tick, 0..=final_tick)
+                            .show_value(false)
+                            .text(""),
+                    );
+                });
             });
-            ui.add(
-                egui::Slider::new(&mut seek_tick, 0..=final_tick)
-                    .show_value(false)
-                    .text("Seek"),
-            );
         });
 
     if loop_changed {
@@ -962,7 +1202,17 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
         }
         transport.play();
         if app.start_audio_with_practice && app.backing_audio.is_loaded() {
-            if app.count_in_active { app.backing_audio.pause(); } else { let p=drums_core::audio_position(transport.elapsed_seconds(),app.audio_sync_offset_ms,app.backing_audio.duration());let _=app.backing_audio.seek(p);app.backing_audio.play(); }
+            if app.count_in_active {
+                app.backing_audio.pause();
+            } else {
+                let p = drums_core::audio_position(
+                    transport.elapsed_seconds(),
+                    app.audio_sync_offset_ms,
+                    app.backing_audio.duration(),
+                );
+                let _ = app.backing_audio.seek(p);
+                app.backing_audio.play();
+            }
         }
     }
     if pause {
@@ -991,7 +1241,14 @@ fn practice_top_bar(app: &mut DrumApp, ui: &mut egui::Ui) {
         if let Some(session) = app.practice_session.as_mut() {
             session.on_seek_to_tick(transport.current_tick(), transport);
         }
-        if app.backing_audio.is_loaded(){let p=drums_core::audio_position(transport.elapsed_seconds(),app.audio_sync_offset_ms,app.backing_audio.duration());let _=app.backing_audio.seek(p);}
+        if app.backing_audio.is_loaded() {
+            let p = drums_core::audio_position(
+                transport.elapsed_seconds(),
+                app.audio_sync_offset_ms,
+                app.backing_audio.duration(),
+            );
+            let _ = app.backing_audio.seek(p);
+        }
     }
     if go_to_tracks {
         transport.pause();
@@ -1039,18 +1296,20 @@ fn rhythm_grid(
     if has_unknown {
         lanes.push(None);
     }
-    // Reserve enough room for the fixed feedback panel below the chart.
-    let height = (ui.available_height() - 132.0).clamp(280.0, 460.0);
+    // The rhythm grid is the primary practice surface. At compact window
+    // sizes it remains usable; on larger displays it receives the extra room.
+    let height = (ui.available_height() - 42.0).clamp(320.0, 720.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(15, 20, 29));
-    let label_width = rect.width().clamp(110.0, 155.0) * 0.85;
+    let geometry = timeline_horizontal_geometry(rect);
+    let label_width = geometry.grid_left - rect.left();
     let header_height = 38.0;
-    let chart_left = rect.left() + label_width;
-    let hit_x = chart_left + (rect.right() - chart_left) * 0.20;
+    let chart_left = geometry.grid_left;
+    let hit_x = geometry.beat_origin;
     let lane_height = (rect.height() - header_height) / lanes.len() as f32;
     let now = transport.elapsed_seconds();
     let past_seconds = 1.5;
@@ -1275,18 +1534,19 @@ fn rhythm_grid(
         ],
         egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(105, 220, 255)),
     );
+    paint_visual_legend(&painter, rect, label_width);
 }
 
 fn actual_result_color(result: &PracticeResult) -> egui::Color32 {
     match result.kind {
         PracticeResultKind::CorrectHit => match result.timing_judgment {
-            Some(TimingJudgment::Early) => egui::Color32::from_rgb(244, 196, 70),
-            Some(TimingJudgment::Late) => egui::Color32::from_rgb(246, 132, 68),
-            _ => egui::Color32::from_rgb(72, 214, 137),
+            Some(TimingJudgment::Early) => RESULT_EARLY,
+            Some(TimingJudgment::Late) => RESULT_LATE,
+            _ => RESULT_CORRECT,
         },
-        PracticeResultKind::WrongDrum => egui::Color32::from_rgb(244, 82, 118),
-        PracticeResultKind::Ignored => egui::Color32::from_rgb(175, 180, 192),
-        PracticeResultKind::Missed => egui::Color32::from_rgb(120, 124, 135),
+        PracticeResultKind::WrongDrum => RESULT_WRONG_DRUM,
+        PracticeResultKind::Ignored => RESULT_EXTRA,
+        PracticeResultKind::Missed => RESULT_MISSED,
     }
 }
 
@@ -1301,17 +1561,57 @@ fn expected_is_missed(note: &ExpectedNote, results: &[PracticeResult]) -> bool {
     })
 }
 
-fn show_visual_legend(ui: &mut egui::Ui) {
-    ui.horizontal_wrapped(|ui| {
-        ui.strong("LEGEND");
-        ui.colored_label(egui::Color32::from_gray(190), "Expected");
-        ui.colored_label(egui::Color32::from_rgb(72, 214, 137), "Correct");
-        ui.colored_label(egui::Color32::from_rgb(244, 196, 70), "Early");
-        ui.colored_label(egui::Color32::from_rgb(246, 132, 68), "Late");
-        ui.colored_label(egui::Color32::from_rgb(244, 82, 118), "Wrong drum");
-        ui.colored_label(egui::Color32::from_gray(120), "Missed");
-        ui.colored_label(egui::Color32::from_rgb(175, 180, 192), "Extra");
-    });
+fn paint_visual_legend(painter: &egui::Painter, rect: egui::Rect, label_width: f32) {
+    let items = [
+        ("Extra", RESULT_EXTRA, false),
+        ("Missed", RESULT_MISSED, false),
+        ("Wrong Drum", RESULT_WRONG_DRUM, false),
+        ("Late", RESULT_LATE, false),
+        ("Early", RESULT_EARLY, false),
+        ("Correct", RESULT_CORRECT, false),
+        ("Expected", egui::Color32::from_rgb(238, 205, 70), true),
+    ];
+    let grid_left = rect.left() + label_width;
+    let available = (rect.right() - grid_left - 16.0).max(1.0);
+    let natural_width = items
+        .iter()
+        .map(|(label, _, _)| label.len() as f32 * 6.2 + 25.0)
+        .sum::<f32>();
+    let scale = (available / natural_width).min(1.0);
+    let font = egui::FontId::proportional((12.0 * scale).max(9.0));
+    let total_width = natural_width * scale;
+    let start_x = (rect.right() - total_width - 8.0).max(grid_left + 8.0);
+    let legend_rect = egui::Rect::from_min_max(
+        egui::pos2(start_x - 6.0, rect.bottom() - 27.0),
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+    );
+    painter.rect_filled(
+        legend_rect,
+        2.0,
+        egui::Color32::from_rgba_unmultiplied(15, 20, 29, 225),
+    );
+    let mut x = start_x;
+    let y = legend_rect.center().y;
+    for (label, color, outlined) in items {
+        let radius = (5.0 * scale).max(3.5);
+        if outlined {
+            painter.circle_stroke(
+                egui::pos2(x + radius, y),
+                radius,
+                egui::Stroke::new(1.5_f32, color),
+            );
+        } else {
+            painter.circle_filled(egui::pos2(x + radius, y), radius, color);
+        }
+        painter.text(
+            egui::pos2(x + radius * 2.0 + 5.0 * scale, y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            egui::Color32::from_gray(205),
+        );
+        x += (label.len() as f32 * 6.2 + 25.0) * scale;
+    }
 }
 
 fn subdivision_token(
@@ -1415,12 +1715,13 @@ fn practice_feedback_bar(app: &DrumApp, ui: &mut egui::Ui) {
     let performance = PracticePerformance::from_session(session);
     let target = session.current_target(transport.current_tick(), transport);
     ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), 112.0),
+        egui::vec2(ui.available_width(), 90.0),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             egui::Frame::group(ui.style())
                 .inner_margin(8.0)
                 .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
                     ui.columns(3, |columns| {
                         columns[0].weak("CURRENT");
                         if let Some(target) = target {
@@ -1443,29 +1744,62 @@ fn practice_feedback_bar(app: &DrumApp, ui: &mut egui::Ui) {
                         } else {
                             columns[0].label("No active target");
                         }
+
                         columns[1].weak("LAST RESULT");
                         if let Some(result) = &app.displayed_practice_result {
                             show_last_result(&mut columns[1], result);
                         } else {
                             columns[1].label("Waiting for input...");
                         }
+
                         columns[2].weak("SESSION");
-                        columns[2].label(
-                            egui::RichText::new(format!(
-                                "{:.1}% accuracy",
-                                performance.accuracy_percent()
-                            ))
-                            .strong()
-                            .size(20.0),
-                        );
-                        columns[2].label(format!(
-                            "{} / {} finalized",
-                            performance.correct_hits, performance.finalized_expected
-                        ));
-                        columns[2].weak(format!(
-                            "Good {}  Early {}  Late {}",
-                            performance.good_hits, performance.early_hits, performance.late_hits
-                        ));
+                        columns[2].horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.1}% accuracy",
+                                        performance.accuracy_percent()
+                                    ))
+                                    .strong()
+                                    .size(20.0),
+                                );
+                                ui.label(format!(
+                                    "{} / {} finalized",
+                                    performance.correct_hits, performance.finalized_expected
+                                ));
+                            });
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
+                                let statistic = |text: String| {
+                                    egui::RichText::new(text)
+                                        .size(12.5)
+                                        .color(egui::Color32::from_gray(185))
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(statistic(format!(
+                                        "Correct {}",
+                                        performance.good_hits
+                                    )));
+                                    ui.label(statistic(format!(
+                                        "Early {}",
+                                        performance.early_hits
+                                    )));
+                                    ui.label(statistic(format!("Late {}", performance.late_hits)));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(statistic(format!(
+                                        "Wrong Drum {}",
+                                        performance.wrong_drums
+                                    )));
+                                    ui.label(statistic(format!("Missed {}", performance.missed)));
+                                    ui.label(statistic(format!(
+                                        "Extra {}",
+                                        performance.ignored_extra_hits
+                                    )));
+                                });
+                            });
+                        });
                     });
                 });
         },
@@ -1834,11 +2168,12 @@ fn show_last_result(ui: &mut egui::Ui, result: &drums_core::PracticeResult) {
                     .size(20.0),
             );
             if let Some(judgment) = result.timing_judgment {
-                ui.label(
-                    egui::RichText::new(format!("{:?}", judgment).to_uppercase())
-                        .strong()
-                        .size(20.0),
-                );
+                let (label, color) = match judgment {
+                    drums_core::TimingJudgment::Early => ("EARLY", RESULT_EARLY),
+                    drums_core::TimingJudgment::Good => ("CORRECT", RESULT_CORRECT),
+                    drums_core::TimingJudgment::Late => ("LATE", RESULT_LATE),
+                };
+                ui.label(egui::RichText::new(label).strong().size(20.0).color(color));
                 if let Some(value) = timing_micros {
                     let milliseconds = value.unsigned_abs() as f64 / 1_000.0;
                     ui.label(match judgment {
@@ -1852,16 +2187,19 @@ fn show_last_result(ui: &mut egui::Ui, result: &drums_core::PracticeResult) {
             }
         }
         PracticeResultKind::WrongDrum => {
-            ui.strong("WRONG DRUM");
+            ui.colored_label(
+                RESULT_WRONG_DRUM,
+                egui::RichText::new("WRONG DRUM").strong(),
+            );
             ui.label(format!("Expected: {}", expected.unwrap_or("N/A")));
             ui.label(format!("Actual: {}", actual.unwrap_or("Unmapped")));
         }
         PracticeResultKind::Missed => {
-            ui.strong("MISSED");
+            ui.colored_label(RESULT_MISSED, egui::RichText::new("MISSED").strong());
             ui.label(format!("Expected: {}", expected.unwrap_or("Unknown")));
         }
         PracticeResultKind::Ignored => {
-            ui.strong("IGNORED");
+            ui.colored_label(RESULT_EXTRA, egui::RichText::new("EXTRA").strong());
             ui.label(format!("Actual: {}", actual.unwrap_or("Unmapped")));
         }
     }
@@ -1882,12 +2220,21 @@ fn show_live_performance(ui: &mut egui::Ui, performance: &PracticePerformance) {
             "Hits: {} / {} finalized",
             performance.correct_hits, performance.finalized_expected
         ));
-        ui.label(format!("Good: {}", performance.good_hits));
-        ui.label(format!("Early: {}", performance.early_hits));
-        ui.label(format!("Late: {}", performance.late_hits));
-        ui.label(format!("Missed: {}", performance.missed));
-        ui.label(format!("Wrong: {}", performance.wrong_drums));
-        ui.label(format!("Extra: {}", performance.ignored_extra_hits));
+        ui.colored_label(
+            RESULT_CORRECT,
+            format!("Correct: {}", performance.good_hits),
+        );
+        ui.colored_label(RESULT_EARLY, format!("Early: {}", performance.early_hits));
+        ui.colored_label(RESULT_LATE, format!("Late: {}", performance.late_hits));
+        ui.colored_label(
+            RESULT_WRONG_DRUM,
+            format!("Wrong Drum: {}", performance.wrong_drums),
+        );
+        ui.colored_label(RESULT_MISSED, format!("Missed: {}", performance.missed));
+        ui.colored_label(
+            RESULT_EXTRA,
+            format!("Extra: {}", performance.ignored_extra_hits),
+        );
     });
 }
 
@@ -1908,16 +2255,25 @@ fn show_performance_summary(ui: &mut egui::Ui, performance: &PracticePerformance
         .num_columns(2)
         .spacing([24.0, 4.0])
         .show(ui, |ui| {
-            ui.label("GOOD");
+            ui.colored_label(RESULT_CORRECT, "CORRECT");
             ui.monospace(performance.good_hits.to_string());
             ui.end_row();
-            ui.label("EARLY");
+            ui.colored_label(RESULT_EARLY, "EARLY");
             ui.monospace(performance.early_hits.to_string());
             ui.end_row();
-            ui.label("LATE");
+            ui.colored_label(RESULT_LATE, "LATE");
             ui.monospace(performance.late_hits.to_string());
             ui.end_row();
-            ui.label("Good percentage");
+            ui.colored_label(RESULT_WRONG_DRUM, "WRONG DRUM");
+            ui.monospace(performance.wrong_drums.to_string());
+            ui.end_row();
+            ui.colored_label(RESULT_MISSED, "MISSED");
+            ui.monospace(performance.missed.to_string());
+            ui.end_row();
+            ui.colored_label(RESULT_EXTRA, "EXTRA");
+            ui.monospace(performance.ignored_extra_hits.to_string());
+            ui.end_row();
+            ui.label("Correct timing percentage");
             ui.monospace(format!("{:.1}%", performance.good_percent()));
             ui.end_row();
             ui.label("Average timing error");
@@ -1930,15 +2286,6 @@ fn show_performance_summary(ui: &mut egui::Ui, performance: &PracticePerformance
             ui.end_row();
             ui.label("Tendency");
             ui.monospace(tendency_text(performance.tendency));
-            ui.end_row();
-            ui.label("Missed");
-            ui.monospace(performance.missed.to_string());
-            ui.end_row();
-            ui.label("Wrong drums");
-            ui.monospace(performance.wrong_drums.to_string());
-            ui.end_row();
-            ui.label("Extra hits");
-            ui.monospace(performance.ignored_extra_hits.to_string());
             ui.end_row();
         });
     ui.add_space(8.0);

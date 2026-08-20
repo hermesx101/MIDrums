@@ -56,7 +56,10 @@ impl SmfFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MidiTiming {
     TicksPerQuarter(u16),
-    Timecode { frames_per_second: u8, ticks_per_frame: u8 },
+    Timecode {
+        frames_per_second: u8,
+        ticks_per_frame: u8,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,11 +146,16 @@ impl MidiFile {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, MidiFileError> {
         let path = path.as_ref();
         let extension = path.extension().and_then(|value| value.to_str());
-        if !extension.is_some_and(|value| value.eq_ignore_ascii_case("mid") || value.eq_ignore_ascii_case("midi")) {
+        if !extension.is_some_and(|value| {
+            value.eq_ignore_ascii_case("mid") || value.eq_ignore_ascii_case("midi")
+        }) {
             return Err(MidiFileError::UnsupportedExtension);
         }
         let bytes = fs::read(path).map_err(|error| MidiFileError::ReadError(error.to_string()))?;
-        let filename = path.file_name().and_then(|value| value.to_str()).unwrap_or("MIDI file");
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("MIDI file");
         Self::parse(filename, &bytes)
     }
 
@@ -155,9 +163,12 @@ impl MidiFile {
         if bytes.is_empty() {
             return Err(MidiFileError::EmptyFile);
         }
-        let smf = Smf::parse(bytes).map_err(|error| MidiFileError::InvalidFile(error.to_string()))?;
+        let smf =
+            Smf::parse(bytes).map_err(|error| MidiFileError::InvalidFile(error.to_string()))?;
         if smf.tracks.is_empty() {
-            return Err(MidiFileError::InvalidFile("file contains no tracks".to_string()));
+            return Err(MidiFileError::InvalidFile(
+                "file contains no tracks".to_string(),
+            ));
         }
 
         let format = match smf.header.format {
@@ -195,22 +206,57 @@ impl MidiFile {
                             // SMF Note On velocity zero is semantically Note Off.
                             if vel.as_int() > 0 {
                                 note_event_count += 1;
-                                notes.push(ParsedNote { tick, timestamp_seconds: 0.0, midi_note: key.as_int(), velocity: vel.as_int(), channel, track: index });
+                                notes.push(ParsedNote {
+                                    tick,
+                                    timestamp_seconds: 0.0,
+                                    midi_note: key.as_int(),
+                                    velocity: vel.as_int(),
+                                    channel,
+                                    track: index,
+                                });
                             }
                         }
                     }
                     TrackEventKind::Meta(MetaMessage::TrackName(value)) => {
                         if name.is_none() {
                             let text = String::from_utf8_lossy(value).trim().to_string();
-                            if !text.is_empty() { name = Some(text); }
+                            if !text.is_empty() {
+                                name = Some(text);
+                            }
                         }
                     }
-                    TrackEventKind::Meta(MetaMessage::Tempo(value)) => tempos.push(TempoEvent { tick, micros_per_quarter: value.as_int() }),
-                    TrackEventKind::Meta(MetaMessage::TimeSignature(numerator, denominator_exponent, clocks, thirty_seconds)) => signatures.push(TimeSignatureEvent { tick, numerator, denominator_exponent, clocks_per_click: clocks, thirty_seconds_per_quarter: thirty_seconds }),
+                    TrackEventKind::Meta(MetaMessage::Tempo(value)) => tempos.push(TempoEvent {
+                        tick,
+                        micros_per_quarter: value.as_int(),
+                    }),
+                    TrackEventKind::Meta(MetaMessage::TimeSignature(
+                        numerator,
+                        denominator_exponent,
+                        clocks,
+                        thirty_seconds,
+                    )) => signatures.push(TimeSignatureEvent {
+                        tick,
+                        numerator,
+                        denominator_exponent,
+                        clocks_per_click: clocks,
+                        thirty_seconds_per_quarter: thirty_seconds,
+                    }),
                     _ => {}
                 }
             }
-            raw_tracks.push((MidiTrack { index, name, event_count: track.len(), note_event_count, channels: channels.into_iter().collect(), likely_drum: false, drum_score: 0, notes }, tick));
+            raw_tracks.push((
+                MidiTrack {
+                    index,
+                    name,
+                    event_count: track.len(),
+                    note_event_count,
+                    channels: channels.into_iter().collect(),
+                    likely_drum: false,
+                    drum_score: 0,
+                    notes,
+                },
+                tick,
+            ));
         }
 
         tempos.sort_by_key(|event| event.tick);
@@ -219,29 +265,63 @@ impl MidiFile {
         deduplicate_signatures(&mut signatures);
         let tempo_map = TempoMap::new(&timing, &tempos);
 
-        let tracks = raw_tracks.into_iter().map(|(mut track, _)| {
-            for note in &mut track.notes { note.timestamp_seconds = tempo_map.seconds_at(note.tick); }
-            track.drum_score = drum_score(&track);
-            track.likely_drum = track.drum_score >= 3;
-            track
-        }).collect();
+        let tracks = raw_tracks
+            .into_iter()
+            .map(|(mut track, _)| {
+                for note in &mut track.notes {
+                    note.timestamp_seconds = tempo_map.seconds_at(note.tick);
+                }
+                track.drum_score = drum_score(&track);
+                track.likely_drum = track.drum_score >= 3;
+                track
+            })
+            .collect();
         let duration_seconds = tempo_map.duration_seconds(duration_ticks);
 
-        Ok(Self { filename: filename.into(), format, timing, tracks, tempo_events: tempos, time_signature_events: signatures, duration_ticks, duration_seconds })
+        Ok(Self {
+            filename: filename.into(),
+            format,
+            timing,
+            tracks,
+            tempo_events: tempos,
+            time_signature_events: signatures,
+            duration_ticks,
+            duration_seconds,
+        })
     }
 
     pub fn suggested_drum_track(&self) -> Option<usize> {
-        self.tracks.iter().filter(|track| track.likely_drum).max_by_key(|track| track.drum_score).map(|track| track.index)
+        self.tracks
+            .iter()
+            .filter(|track| track.likely_drum)
+            .max_by_key(|track| track.drum_score)
+            .map(|track| track.index)
     }
 
-    pub fn expected_notes_for_track(&self, track_index: usize, mapping: Option<&DrumKitConfiguration>) -> Vec<ExpectedNote> {
-        let Some(track) = self.tracks.get(track_index) else { return Vec::new(); };
-        track.notes.iter().map(|note| ExpectedNote {
-            tick: note.tick, timestamp_seconds: note.timestamp_seconds, midi_note: note.midi_note, velocity: note.velocity, channel: note.channel, track: note.track,
-            drum_component: general_midi_component(note.midi_note),
-            target_component: general_midi_component(note.midi_note)
-                .filter(|component| mapping.is_some_and(|config| config.get(*component).is_some())),
-        }).collect()
+    pub fn expected_notes_for_track(
+        &self,
+        track_index: usize,
+        mapping: Option<&DrumKitConfiguration>,
+    ) -> Vec<ExpectedNote> {
+        let Some(track) = self.tracks.get(track_index) else {
+            return Vec::new();
+        };
+        track
+            .notes
+            .iter()
+            .map(|note| ExpectedNote {
+                tick: note.tick,
+                timestamp_seconds: note.timestamp_seconds,
+                midi_note: note.midi_note,
+                velocity: note.velocity,
+                channel: note.channel,
+                track: note.track,
+                drum_component: general_midi_component(note.midi_note),
+                target_component: general_midi_component(note.midi_note).filter(|component| {
+                    mapping.is_some_and(|config| config.get(*component).is_some())
+                }),
+            })
+            .collect()
     }
 }
 
@@ -265,35 +345,77 @@ pub fn general_midi_component(midi_note: u8) -> Option<DrumComponent> {
 
 fn drum_score(track: &MidiTrack) -> u8 {
     let mut score = 0;
-    if track.channels.contains(&9) { score += 4; }
-    if track.name.as_deref().is_some_and(|name| { let name = name.to_ascii_lowercase(); name.contains("drum") || name.contains("percussion") || name.contains("perc") }) { score += 3; }
+    if track.channels.contains(&9) {
+        score += 4;
+    }
+    if track.name.as_deref().is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        name.contains("drum") || name.contains("percussion") || name.contains("perc")
+    }) {
+        score += 3;
+    }
     if !track.notes.is_empty() {
-        let percussion = track.notes.iter().filter(|note| (35..=81).contains(&note.midi_note)).count();
-        if percussion * 2 >= track.notes.len() { score += 2; }
+        let percussion = track
+            .notes
+            .iter()
+            .filter(|note| (35..=81).contains(&note.midi_note))
+            .count();
+        if percussion * 2 >= track.notes.len() {
+            score += 2;
+        }
     }
     score
 }
 
-fn deduplicate_tempos(events: &mut Vec<TempoEvent>) { events.dedup_by(|a, b| a.tick == b.tick && { *b = a.clone(); true }); }
-fn deduplicate_signatures(events: &mut Vec<TimeSignatureEvent>) { events.dedup_by(|a, b| a.tick == b.tick && { *b = a.clone(); true }); }
+fn deduplicate_tempos(events: &mut Vec<TempoEvent>) {
+    events.dedup_by(|a, b| {
+        a.tick == b.tick && {
+            *b = a.clone();
+            true
+        }
+    });
+}
+fn deduplicate_signatures(events: &mut Vec<TimeSignatureEvent>) {
+    events.dedup_by(|a, b| {
+        a.tick == b.tick && {
+            *b = a.clone();
+            true
+        }
+    });
+}
 
-struct TempoMap<'a> { timing: &'a MidiTiming, events: &'a [TempoEvent] }
+struct TempoMap<'a> {
+    timing: &'a MidiTiming,
+    events: &'a [TempoEvent],
+}
 impl<'a> TempoMap<'a> {
-    fn new(timing: &'a MidiTiming, events: &'a [TempoEvent]) -> Self { Self { timing, events } }
+    fn new(timing: &'a MidiTiming, events: &'a [TempoEvent]) -> Self {
+        Self { timing, events }
+    }
     fn seconds_at(&self, target: u64) -> f64 {
         match self.timing {
-            MidiTiming::Timecode { frames_per_second, ticks_per_frame } => target as f64 / (*frames_per_second as f64 * *ticks_per_frame as f64),
+            MidiTiming::Timecode {
+                frames_per_second,
+                ticks_per_frame,
+            } => target as f64 / (*frames_per_second as f64 * *ticks_per_frame as f64),
             MidiTiming::TicksPerQuarter(tpq) => {
-                let mut seconds = 0.0; let mut previous_tick = 0; let mut tempo = DEFAULT_MICROS_PER_QUARTER;
+                let mut seconds = 0.0;
+                let mut previous_tick = 0;
+                let mut tempo = DEFAULT_MICROS_PER_QUARTER;
                 for event in self.events.iter().filter(|event| event.tick <= target) {
-                    seconds += (event.tick - previous_tick) as f64 * tempo as f64 / (*tpq as f64 * 1_000_000.0);
-                    previous_tick = event.tick; tempo = event.micros_per_quarter;
+                    seconds += (event.tick - previous_tick) as f64 * tempo as f64
+                        / (*tpq as f64 * 1_000_000.0);
+                    previous_tick = event.tick;
+                    tempo = event.micros_per_quarter;
                 }
-                seconds + (target - previous_tick) as f64 * tempo as f64 / (*tpq as f64 * 1_000_000.0)
+                seconds
+                    + (target - previous_tick) as f64 * tempo as f64 / (*tpq as f64 * 1_000_000.0)
             }
         }
     }
-    fn duration_seconds(&self, ticks: u64) -> Option<f64> { Some(self.seconds_at(ticks)) }
+    fn duration_seconds(&self, ticks: u64) -> Option<f64> {
+        Some(self.seconds_at(ticks))
+    }
 }
 
 #[cfg(test)]
@@ -302,26 +424,81 @@ mod tests {
     use crate::mapping::DrumMapping;
 
     fn midi(track_chunks: &[Vec<u8>], format: u16) -> Vec<u8> {
-        let mut out = b"MThd\0\0\0\x06".to_vec(); out.extend_from_slice(&format.to_be_bytes()); out.extend_from_slice(&(track_chunks.len() as u16).to_be_bytes()); out.extend_from_slice(&480u16.to_be_bytes());
-        for chunk in track_chunks { out.extend_from_slice(b"MTrk"); out.extend_from_slice(&(chunk.len() as u32).to_be_bytes()); out.extend_from_slice(chunk); } out
+        let mut out = b"MThd\0\0\0\x06".to_vec();
+        out.extend_from_slice(&format.to_be_bytes());
+        out.extend_from_slice(&(track_chunks.len() as u16).to_be_bytes());
+        out.extend_from_slice(&480u16.to_be_bytes());
+        for chunk in track_chunks {
+            out.extend_from_slice(b"MTrk");
+            out.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out
     }
-    fn end() -> Vec<u8> { vec![0, 0xff, 0x2f, 0] }
+    fn end() -> Vec<u8> {
+        vec![0, 0xff, 0x2f, 0]
+    }
     #[test]
     fn parses_notes_metadata_tracks_timing_and_mapping() {
-        let mut conductor = vec![0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0, 0xff, 0x58, 4, 4, 2, 24, 8]; conductor.extend(end());
-        let mut drums = vec![0, 0xff, 0x03, 5, b'D', b'r', b'u', b'm', b's', 0, 0x99, 36, 100, 0, 0x99, 36, 0, 0x83, 0x60, 0x99, 38, 110]; drums.extend(end());
+        let mut conductor = vec![
+            0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0, 0xff, 0x58, 4, 4, 2, 24, 8,
+        ];
+        conductor.extend(end());
+        let mut drums = vec![
+            0, 0xff, 0x03, 5, b'D', b'r', b'u', b'm', b's', 0, 0x99, 36, 100, 0, 0x99, 36, 0, 0x83,
+            0x60, 0x99, 38, 110,
+        ];
+        drums.extend(end());
         let file = MidiFile::parse("fixture.mid", &midi(&[conductor, drums], 1)).unwrap();
-        assert_eq!(file.format, SmfFormat::Format1); assert_eq!(file.timing, MidiTiming::TicksPerQuarter(480)); assert_eq!(file.tracks.len(), 2); assert_eq!(file.tracks[1].name.as_deref(), Some("Drums")); assert_eq!(file.tracks[1].note_event_count, 2); assert_eq!(file.tracks[1].notes[1].tick, 480); assert_eq!(file.tracks[1].notes[1].velocity, 110); assert_eq!(file.tempo_events[0].bpm(), 120.0); assert_eq!(file.time_signature_events[0].denominator(), 4); assert_eq!(file.suggested_drum_track(), Some(1));
-        let mut mapping = DrumKitConfiguration::new("kit"); mapping.set(DrumMapping { component: DrumComponent::Kick, event_kind: Default::default(), midi_note: 24, channel: 10 });
-        let expected = file.expected_notes_for_track(1, Some(&mapping)); assert_eq!(expected[0].drum_component, Some(DrumComponent::Kick)); assert_eq!(expected[0].target_component, Some(DrumComponent::Kick)); assert_eq!(expected[1].drum_component, Some(DrumComponent::Snare)); assert_eq!(expected[1].target_component, None);
+        assert_eq!(file.format, SmfFormat::Format1);
+        assert_eq!(file.timing, MidiTiming::TicksPerQuarter(480));
+        assert_eq!(file.tracks.len(), 2);
+        assert_eq!(file.tracks[1].name.as_deref(), Some("Drums"));
+        assert_eq!(file.tracks[1].note_event_count, 2);
+        assert_eq!(file.tracks[1].notes[1].tick, 480);
+        assert_eq!(file.tracks[1].notes[1].velocity, 110);
+        assert_eq!(file.tempo_events[0].bpm(), 120.0);
+        assert_eq!(file.time_signature_events[0].denominator(), 4);
+        assert_eq!(file.suggested_drum_track(), Some(1));
+        let mut mapping = DrumKitConfiguration::new("kit");
+        mapping.set(DrumMapping {
+            component: DrumComponent::Kick,
+            event_kind: Default::default(),
+            midi_note: 24,
+            channel: 10,
+            articulation: None,
+            cc_range: None,
+        });
+        let expected = file.expected_notes_for_track(1, Some(&mapping));
+        assert_eq!(expected[0].drum_component, Some(DrumComponent::Kick));
+        assert_eq!(expected[0].target_component, Some(DrumComponent::Kick));
+        assert_eq!(expected[1].drum_component, Some(DrumComponent::Snare));
+        assert_eq!(expected[1].target_component, None);
     }
     #[test]
     fn preserves_multiple_tempo_changes_and_note_offs_are_not_hits() {
-        let mut track = vec![0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0x83, 0x60, 0xff, 0x51, 3, 0x09, 0x27, 0xc0, 0, 0x89, 40, 64, 0, 0x99, 42, 0, 0x83, 0x60, 0x99, 42, 90]; track.extend(end());
-        let file = MidiFile::parse("tempo.mid", &midi(&[track], 0)).unwrap(); assert_eq!(file.tempo_events.len(), 2); assert_eq!(file.tracks[0].notes.len(), 1); assert_eq!(file.tracks[0].notes[0].tick, 960); assert!((file.tracks[0].notes[0].timestamp_seconds - 1.1).abs() < 0.0001);
+        let mut track = vec![
+            0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, 0x83, 0x60, 0xff, 0x51, 3, 0x09, 0x27, 0xc0, 0,
+            0x89, 40, 64, 0, 0x99, 42, 0, 0x83, 0x60, 0x99, 42, 90,
+        ];
+        track.extend(end());
+        let file = MidiFile::parse("tempo.mid", &midi(&[track], 0)).unwrap();
+        assert_eq!(file.tempo_events.len(), 2);
+        assert_eq!(file.tracks[0].notes.len(), 1);
+        assert_eq!(file.tracks[0].notes[0].tick, 960);
+        assert!((file.tracks[0].notes[0].timestamp_seconds - 1.1).abs() < 0.0001);
     }
     #[test]
-    fn invalid_and_empty_files_are_errors() { assert_eq!(MidiFile::parse("x.mid", &[]).unwrap_err(), MidiFileError::EmptyFile); assert!(matches!(MidiFile::parse("x.mid", b"not midi"), Err(MidiFileError::InvalidFile(_)))); }
+    fn invalid_and_empty_files_are_errors() {
+        assert_eq!(
+            MidiFile::parse("x.mid", &[]).unwrap_err(),
+            MidiFileError::EmptyFile
+        );
+        assert!(matches!(
+            MidiFile::parse("x.mid", b"not midi"),
+            Err(MidiFileError::InvalidFile(_))
+        ));
+    }
     #[test]
     fn general_midi_notes_map_to_supported_drum_components() {
         assert_eq!(general_midi_component(36), Some(DrumComponent::Kick));
@@ -334,10 +511,18 @@ mod tests {
     }
     #[test]
     fn unknown_notes_are_preserved_without_guessing_or_using_hardware_notes() {
-        let mut track = vec![0, 0x99, 12, 100, 0, 0x99, 36, 110]; track.extend(end());
+        let mut track = vec![0, 0x99, 12, 100, 0, 0x99, 36, 110];
+        track.extend(end());
         let file = MidiFile::parse("unknown.mid", &midi(&[track], 0)).unwrap();
         let mut mapping = DrumKitConfiguration::new("NUX DM-1");
-        mapping.set(DrumMapping { component: DrumComponent::Kick, event_kind: Default::default(), midi_note: 24, channel: 10 });
+        mapping.set(DrumMapping {
+            component: DrumComponent::Kick,
+            event_kind: Default::default(),
+            midi_note: 24,
+            channel: 10,
+            articulation: None,
+            cc_range: None,
+        });
         let expected = file.expected_notes_for_track(0, Some(&mapping));
         assert_eq!(expected.len(), 2);
         assert_eq!(expected[0].midi_note, 12);
@@ -351,12 +536,19 @@ mod tests {
     #[test]
     fn imports_from_a_midi_path_and_reports_path_errors() {
         let path = std::env::temp_dir().join(format!("drums_phase3a_{}.mid", std::process::id()));
-        let mut track = vec![0, 0x99, 36, 100]; track.extend(end());
+        let mut track = vec![0, 0x99, 36, 100];
+        track.extend(end());
         std::fs::write(&path, midi(&[track], 0)).unwrap();
         let imported = MidiFile::from_path(&path).unwrap();
         assert_eq!(imported.tracks[0].notes[0].midi_note, 36);
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(MidiFile::from_path("not-midi.txt").unwrap_err(), MidiFileError::UnsupportedExtension);
-        assert!(matches!(MidiFile::from_path("missing.mid"), Err(MidiFileError::ReadError(_))));
+        assert_eq!(
+            MidiFile::from_path("not-midi.txt").unwrap_err(),
+            MidiFileError::UnsupportedExtension
+        );
+        assert!(matches!(
+            MidiFile::from_path("missing.mid"),
+            Err(MidiFileError::ReadError(_))
+        ));
     }
 }

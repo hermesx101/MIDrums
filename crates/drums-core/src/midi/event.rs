@@ -65,9 +65,9 @@ impl MidiMessage {
     /// Note Off, Polyphonic Aftertouch), otherwise `None`.
     pub fn note(&self) -> Option<u8> {
         match self.kind {
-            MessageKind::NoteOn
-            | MessageKind::NoteOff
-            | MessageKind::PolyphonicAftertouch => self.data1,
+            MessageKind::NoteOn | MessageKind::NoteOff | MessageKind::PolyphonicAftertouch => {
+                self.data1
+            }
             _ => None,
         }
     }
