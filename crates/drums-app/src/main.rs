@@ -1,4 +1,4 @@
-//! DRUMS desktop GUI (Phase 1 + Phase 2).
+//! Egui/eframe application shell for MI Drums.
 //!
 //! This crate is deliberately tiny: it owns the egui/eframe front-end and
 //! delegates all MIDI work to `drums-core`. The MIDI backend runs its own
@@ -7,21 +7,25 @@
 //! frame rate is never a timing source — every event carries the
 //! high-resolution timestamp captured at the moment it was received.
 //!
-//! Phase 2 adds two focused flows on top of the Phase 1 monitor:
+//! Two focused configuration flows complement the practice UI:
 //! - the **setup wizard** (`wizard_ui`), which learns each drum's MIDI note by
 //!   waiting for, and asking the user to confirm, real MIDI hits, and
 //! - the **manual mapping** view (`mapping_ui`) for inspecting/editing a
-//!   device's saved configuration.
+//!   device's saved configuration. Mapping, timing, and scoring behavior stays
+//!   in `drums-core` so the front-end does not duplicate domain logic.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_output;
 mod backing_audio;
 mod click_audio;
 mod mapping_ui;
 mod midi_file_ui;
+mod monitor_ui;
 mod notation_ui;
 mod performance_analysis_ui;
 mod practice_settings;
+mod preferences_ui;
 mod progress_ui;
 mod track_library;
 mod wizard_ui;
@@ -30,8 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use drums_core::mapping::{
-    DrumKitConfiguration, MappingEventKind, MappingInputIdentity, MappingStore, SetupWizard,
-    SUPPORTED_COMPONENTS,
+    DrumKitConfiguration, MappingStore, ObservedMidiInput, SetupWizard, SUPPORTED_COMPONENTS,
 };
 use drums_core::time::{SharedClock, SystemClock};
 use drums_core::{
@@ -41,7 +44,13 @@ use drums_core::{
     SubdivisionSuggestion, Timeline,
 };
 use eframe::egui;
+use practice_settings::{AccentColour, ThemePreference, UiScale};
 use track_library::{LibraryEntry, LibrarySort};
+
+const MIDI_CONNECTION_REFRESH_FRAMES: u64 = 60;
+const MAX_MIDI_EVENT_LOG_ENTRIES: usize = 400;
+const DEFAULT_PRACTICE_LOOKAHEAD_SECONDS: f64 = 4.0;
+const AUDIO_OUTPUT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Top-level views the app can show.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,6 +65,7 @@ enum View {
     PerformanceAnalysis,
     Progress,
     SheetMusic,
+    Preferences,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,11 +121,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 420.0])
-            .with_title("MIDI Drum Practice - Phase 5A"),
+            .with_title("MI Drums"),
         ..Default::default()
     };
     eframe::run_native(
-        "MIDI Drum Practice",
+        "MI Drums",
         options,
         Box::new(|cc| Ok(Box::new(DrumApp::new(cc)))),
     )
@@ -171,6 +181,10 @@ struct DrumApp {
     subdivision_auto: bool,
     subdivision_suggestion: Option<SubdivisionSuggestion>,
     metronome_enabled: bool,
+    /// Persisted presentation-only filter for the Timeline practice view.
+    expected_drums_only: bool,
+    /// Logical drum roles cached when the active lesson context changes.
+    expected_timeline_drums: midi_file_ui::ExpectedTimelineDrums,
     /// UI-only future window for the Phase 5A rhythm chart.
     practice_lookahead_seconds: f64,
     practice_loop_mode: PracticeLoopMode,
@@ -201,16 +215,21 @@ struct DrumApp {
     notation_follow_playback: bool,
     notation_follow_suspended_until: Option<Instant>,
     practice_visual: PracticeVisual,
-    click_audio: click_audio::ClickAudio,
+    audio_output: audio_output::AudioOutput,
+    last_audio_output_refresh: Instant,
     backing_audio: backing_audio::BackingAudio,
     audio_sync_offset_ms: f64,
     midi_input_latency_ms: f64,
     start_audio_with_practice: bool,
+    theme_preference: ThemePreference,
+    accent_colour: AccentColour,
+    ui_scale: UiScale,
+    reset_confirmation: preferences_ui::ResetConfirmation,
 }
 
 impl DrumApp {
-    fn save_practice_settings(&self) {
-        let _ = practice_settings::save(&practice_settings::PracticeSettings {
+    fn save_practice_settings(&self) -> std::io::Result<()> {
+        practice_settings::save(&practice_settings::PracticeSettings {
             midi_input_latency_ms: self.midi_input_latency_ms,
             audio_sync_offset_ms: self.audio_sync_offset_ms,
             start_audio_with_practice: self.start_audio_with_practice,
@@ -219,8 +238,146 @@ impl DrumApp {
                 PracticeVisual::SheetMusic => "sheet_music",
             }
             .into(),
-        });
+            expected_drums_only: self.expected_drums_only,
+            audio_output_device: self.audio_output.preferred_device().map(str::to_string),
+            output_volume: self.audio_output.volume(),
+            output_muted: self.audio_output.muted(),
+            theme: self.theme_preference,
+            accent_colour: self.accent_colour,
+            ui_scale: self.ui_scale,
+        })
     }
+
+    fn accent_color(&self) -> egui::Color32 {
+        accent_color(self.accent_colour)
+    }
+
+    fn restore_first_launch_after_reset(&mut self, ctx: &egui::Context) {
+        let defaults = practice_settings::PracticeSettings::default();
+        self.backend.disconnect();
+        self.connected = false;
+        self.events.clear();
+        self.active_config = None;
+        self.wizard = None;
+        self.wizard_device = None;
+        self.wizard_last_input = None;
+        self.mapping_draft = None;
+        self.mapping_reassign_component = None;
+        self.mapping_replace_component = false;
+        self.mapping_reassign_after_micros = 0;
+        self.mapping_reassign_candidate = None;
+        self.mapping_reassign_started = None;
+        self.mapping_last_input = None;
+        self.mapping_last_detected_component = None;
+
+        self.imported_midi = None;
+        self.selected_drum_track = None;
+        self.midi_import_error = None;
+        self.transport = None;
+        self.timeline = None;
+        self.practice_session = None;
+        self.active_session_recording = None;
+        self.last_live_hit = None;
+        self.displayed_practice_result = None;
+        self.displayed_result_since = None;
+        self.observed_practice_result_count = 0;
+        self.last_transport_update = Instant::now();
+        self.metronome = Metronome::new(Subdivision::Eighth);
+        self.subdivision_auto = true;
+        self.subdivision_suggestion = None;
+        self.metronome_enabled = false;
+        self.expected_drums_only = defaults.expected_drums_only;
+        self.expected_timeline_drums = midi_file_ui::ExpectedTimelineDrums::default();
+        self.practice_lookahead_seconds = DEFAULT_PRACTICE_LOOKAHEAD_SECONDS;
+        self.practice_loop_mode = PracticeLoopMode::Off;
+        self.practice_loop_start_tick = 0;
+        self.practice_loop_end_tick = 0;
+        self.practice_loop_start_bar = 1;
+        self.practice_loop_end_bar = 2;
+        self.practice_loop_iteration = 1;
+        self.count_in_bars = 0;
+        self.count_in_active = false;
+        self.count_in_end_tick = 0;
+        self.count_in_target_tick = 0;
+
+        self.track_library.clear();
+        self.library_search.clear();
+        self.library_sort = LibrarySort::RecentlyAdded;
+        self.library_rename_path = None;
+        self.library_rename_buffer.clear();
+        self.library_remove_path = None;
+        self.current_library_path = None;
+        self.library_selected_path = None;
+        self.completion_saved = false;
+        self.analysis_track_path = None;
+        self.analysis_session_id = None;
+        self.progress_track_path = None;
+        self.progress_data = None;
+        self.notation_score = None;
+        self.notation_zoom = 1.0;
+        self.notation_follow_playback = false;
+        self.notation_follow_suspended_until = None;
+        self.practice_visual = PracticeVisual::Timeline;
+        self.backing_audio.stop();
+        self.backing_audio.unload();
+        self.audio_output.set_volume(defaults.output_volume);
+        self.audio_output.set_muted(defaults.output_muted);
+        self.audio_output
+            .select_device(defaults.audio_output_device.clone());
+        let _ = self.sync_backing_audio_output();
+        self.last_audio_output_refresh = Instant::now();
+
+        self.midi_input_latency_ms = defaults.midi_input_latency_ms;
+        self.audio_sync_offset_ms = defaults.audio_sync_offset_ms;
+        self.start_audio_with_practice = defaults.start_audio_with_practice;
+        self.theme_preference = defaults.theme;
+        self.accent_colour = defaults.accent_colour;
+        self.ui_scale = defaults.ui_scale;
+        apply_app_appearance(
+            ctx,
+            self.theme_preference,
+            self.accent_colour,
+            self.ui_scale,
+        );
+
+        self.view = View::Setup;
+        self.status =
+            "All application data was reset. Connect a MIDI device to begin setup.".to_string();
+    }
+
+    fn navigate_away_from_practice(&mut self, view: View) {
+        if let Some(transport) = self.transport.as_mut() {
+            transport.pause();
+            self.metronome.sync_to_transport(transport);
+        }
+        self.view = view;
+        self.backing_audio.stop();
+    }
+
+    fn resync_backing_audio(&mut self) {
+        let Some(transport) = self.transport.as_ref() else {
+            return;
+        };
+        let position = drums_core::audio_position(
+            transport.elapsed_seconds(),
+            self.audio_sync_offset_ms,
+            self.backing_audio.duration(),
+        );
+        let _ = self.backing_audio.seek(position);
+    }
+
+    fn sync_backing_audio_output(&mut self) -> Result<(), String> {
+        self.backing_audio.set_output(
+            self.audio_output.handle(),
+            self.audio_output.effective_gain(),
+        )
+    }
+
+    fn apply_audio_output_gain(&mut self) {
+        self.backing_audio
+            .set_output_gain(self.audio_output.effective_gain());
+    }
+
     fn new(ctx: &eframe::CreationContext<'_>) -> Self {
         let practice_settings = practice_settings::load();
         let clock: SharedClock = Arc::new(SystemClock::new());
@@ -240,15 +397,32 @@ impl DrumApp {
             Ok(ps) => (ps, String::new()),
             Err(e) => (Vec::new(), format!("MIDI unavailable: {e}")),
         };
-        let selected = (ports.len() == 1).then_some(ports[0].index);
+        let selected = sole_port_index(&ports);
 
-        set_app_style(&ctx.egui_ctx);
+        apply_app_appearance(
+            &ctx.egui_ctx,
+            practice_settings.theme,
+            practice_settings.accent_colour,
+            practice_settings.ui_scale,
+        );
 
         let store = MappingStore::default();
         let needs_initial_setup = store
             .load_all()
             .map(|configs| needs_initial_setup(&configs))
             .unwrap_or(true);
+        let audio_output = audio_output::AudioOutput::new(
+            practice_settings.audio_output_device.clone(),
+            practice_settings.output_volume,
+            practice_settings.output_muted,
+        );
+        let backing_audio =
+            backing_audio::BackingAudio::new(audio_output.handle(), audio_output.effective_gain());
+        let status = match (status.is_empty(), audio_output.notice()) {
+            (true, Some(notice)) => notice.to_string(),
+            (false, Some(notice)) => format!("{status} {notice}"),
+            _ => status,
+        };
 
         Self {
             clock,
@@ -295,7 +469,9 @@ impl DrumApp {
             subdivision_auto: true,
             subdivision_suggestion: None,
             metronome_enabled: false,
-            practice_lookahead_seconds: 4.0,
+            expected_drums_only: practice_settings.expected_drums_only,
+            expected_timeline_drums: midi_file_ui::ExpectedTimelineDrums::default(),
+            practice_lookahead_seconds: DEFAULT_PRACTICE_LOOKAHEAD_SECONDS,
             practice_loop_mode: PracticeLoopMode::Off,
             practice_loop_start_tick: 0,
             practice_loop_end_tick: 0,
@@ -328,83 +504,80 @@ impl DrumApp {
             } else {
                 PracticeVisual::Timeline
             },
-            click_audio: click_audio::ClickAudio::new(),
-            backing_audio: backing_audio::BackingAudio::new(),
+            audio_output,
+            last_audio_output_refresh: Instant::now(),
+            backing_audio,
             audio_sync_offset_ms: practice_settings.audio_sync_offset_ms,
             midi_input_latency_ms: practice_settings.midi_input_latency_ms,
             start_audio_with_practice: practice_settings.start_audio_with_practice,
+            theme_preference: practice_settings.theme,
+            accent_colour: practice_settings.accent_colour,
+            ui_scale: practice_settings.ui_scale,
+            reset_confirmation: preferences_ui::ResetConfirmation::default(),
         }
     }
 
     fn drain_events(&mut self) {
         let new_events = self.backend.poll_events();
         let observed_at_micros = self.clock.now_micros();
+        self.forward_events_to_setup_wizard(&new_events);
+        for event in new_events {
+            self.update_mapping_diagnostics(&event);
+            self.handle_practice_midi_event(&event, observed_at_micros);
+            self.events.insert(0, event);
+        }
+        self.events.truncate(MAX_MIDI_EVENT_LOG_ENTRIES);
+    }
+
+    fn forward_events_to_setup_wizard(&mut self, events: &[MidiEvent]) {
         // While a setup run is active, every incoming MIDI event is also pushed
         // into the wizard so it can spot the note the user hits. The wizard
         // handles Note On/Off filtering and confirmation itself.
-        if self.wizard.is_some() {
-            for ev in &new_events {
-                if self
-                    .wizard
-                    .as_ref()
-                    .is_some_and(|wizard| wizard.is_current_step_event(ev))
-                {
-                    self.wizard_last_input = Some(ev.clone());
-                }
-                if let Some(wizard) = self.wizard.as_mut() {
-                    wizard.handle_event(ev);
-                }
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        for event in events {
+            if wizard.is_current_step_event(event) {
+                self.wizard_last_input = Some(event.clone());
             }
+            wizard.handle_event(event);
         }
-        for ev in new_events {
-            if (ev.message.kind == drums_core::MessageKind::NoteOn
-                && ev.message.velocity().unwrap_or(0) > 0)
-                || ev.message.kind == drums_core::MessageKind::ControlChange
-            {
-                self.mapping_last_input = Some(ev.clone());
-                self.mapping_last_detected_component =
-                    self.active_config.as_ref().and_then(|config| {
-                        let channel = ev.message.channel_number()?;
-                        let (kind, number) = match ev.message.kind {
-                            drums_core::MessageKind::NoteOn => {
-                                (MappingEventKind::Note, ev.message.note()?)
-                            }
-                            drums_core::MessageKind::ControlChange => {
-                                (MappingEventKind::ControlChange, ev.message.data1?)
-                            }
-                            _ => return None,
-                        };
-                        config.resolve(MappingInputIdentity {
-                            event_kind: kind,
-                            number,
-                            channel,
-                        })
-                    });
-            }
-            if let (Some(config), Some(transport)) = (&self.active_config, &self.transport) {
-                if let Some(mut hit) = ActualHit::from_midi_event_observed_at(
-                    &ev,
-                    config,
-                    transport,
-                    observed_at_micros,
-                ) {
-                    hit.elapsed_seconds = drums_core::compensate_midi_input(
-                        hit.elapsed_seconds,
-                        self.midi_input_latency_ms,
-                    );
-                    hit.transport_tick = transport.effective_tick_at_seconds(hit.elapsed_seconds);
-                    self.last_live_hit = Some(hit.clone());
-                    if transport.is_playing() && !self.count_in_active {
-                        if let Some(session) = self.practice_session.as_mut() {
-                            session.record_hit(hit, transport);
-                        }
-                    }
-                }
-            }
-            self.events.insert(0, ev);
+    }
+
+    fn update_mapping_diagnostics(&mut self, event: &MidiEvent) {
+        let Some(input) = ObservedMidiInput::from_event(event) else {
+            return;
+        };
+        self.mapping_last_input = Some(event.clone());
+        self.mapping_last_detected_component = self
+            .active_config
+            .as_ref()
+            .and_then(|config| config.resolve(input.identity()));
+    }
+
+    fn handle_practice_midi_event(&mut self, event: &MidiEvent, observed_at_micros: u64) {
+        let Some(config) = self.active_config.as_ref() else {
+            return;
+        };
+        if let Some(session) = self.practice_session.as_mut() {
+            session.update_hi_hat_pedal_state(event, config);
         }
-        if self.events.len() > 400 {
-            self.events.truncate(400);
+        let Some(transport) = self.transport.as_ref() else {
+            return;
+        };
+        let Some(mut hit) =
+            ActualHit::from_midi_event_observed_at(event, config, transport, observed_at_micros)
+        else {
+            return;
+        };
+        hit.elapsed_seconds =
+            drums_core::compensate_midi_input(hit.elapsed_seconds, self.midi_input_latency_ms);
+        hit.transport_tick = transport.effective_tick_at_seconds(hit.elapsed_seconds);
+        self.last_live_hit = Some(hit.clone());
+        if transport.is_playing() && !self.count_in_active {
+            if let Some(session) = self.practice_session.as_mut() {
+                session.record_hit(hit, transport);
+            }
         }
     }
 
@@ -436,21 +609,26 @@ impl DrumApp {
                 self.events.clear();
                 // Restore a previously saved mapping for this device, so the
                 // same kit reconnects to the configuration the user built.
-                let stored = self
-                    .store
-                    .load(&name)
-                    .unwrap_or(None)
-                    .filter(DrumKitConfiguration::is_usable);
+                let (stored, mapping_load_error) = match self.store.load(&name) {
+                    Ok(config) => (config.filter(DrumKitConfiguration::is_usable), None),
+                    Err(error) => (None, Some(error)),
+                };
                 self.active_config = stored.clone();
                 self.mapping_draft = None;
-                self.status = match &stored {
-                    Some(cfg) => format!(
-                        "Connected to {name}. Restored mapping: {} of {} drums configured.",
-                        cfg.mapped_component_count(),
-                        SUPPORTED_COMPONENTS.len()
-                    ),
-                    None => {
-                        format!("Connected to {name}. No saved mapping yet - run the Setup Wizard.")
+                self.status = if let Some(error) = mapping_load_error {
+                    format!(
+                        "Connected to {name}, but its saved drum mapping could not be loaded: {error}"
+                    )
+                } else {
+                    match &stored {
+                        Some(cfg) => format!(
+                            "Connected to {name}. Restored mapping: {} of {} drums configured.",
+                            cfg.mapped_component_count(),
+                            SUPPORTED_COMPONENTS.len()
+                        ),
+                        None => format!(
+                            "Connected to {name}. No saved mapping yet - run the Setup Wizard."
+                        ),
                     }
                 };
                 if stored.is_none() {
@@ -537,12 +715,14 @@ impl DrumApp {
         ) else {
             self.timeline = None;
             self.practice_session = None;
+            self.expected_timeline_drums = midi_file_ui::ExpectedTimelineDrums::default();
             self.displayed_practice_result = None;
             self.displayed_result_since = None;
             self.observed_practice_result_count = 0;
             return;
         };
         let notes = file.expected_notes_for_track(track, self.active_config.as_ref());
+        self.expected_timeline_drums = midi_file_ui::ExpectedTimelineDrums::from_expected(&notes);
         self.notation_score = drums_core::DrumNotationScore::from_expected_notes(file, &notes);
         let suggestion = suggest_subdivision(file.timing, &notes);
         self.subdivision_suggestion = Some(suggestion);
@@ -766,7 +946,7 @@ impl eframe::App for DrumApp {
         self.frames = self.frames.wrapping_add(1);
 
         // Periodic (~1s) disconnect detection. Cheap re-enumeration only.
-        if self.frames % 60 == 0 {
+        if self.frames.is_multiple_of(MIDI_CONNECTION_REFRESH_FRAMES) {
             let was_connected = self.connected;
             let alive = self.backend.refresh_connection();
             if was_connected && !alive {
@@ -782,6 +962,31 @@ impl eframe::App for DrumApp {
         }
 
         let now = Instant::now();
+        if now.duration_since(self.last_audio_output_refresh) >= AUDIO_OUTPUT_REFRESH_INTERVAL {
+            self.last_audio_output_refresh = now;
+            let update = self.audio_output.refresh_devices();
+            if update.route_changed {
+                match self.sync_backing_audio_output() {
+                    Err(error) => {
+                        self.status = format!(
+                            "Audio output changed, but backing audio could not be routed: {error}"
+                        );
+                    }
+                    Ok(()) => {
+                        self.status = update.notice.unwrap_or_else(|| {
+                            format!(
+                                "Audio output restored to {}.",
+                                self.audio_output
+                                    .active_device()
+                                    .unwrap_or(audio_output::DEFAULT_SYSTEM_DEVICE)
+                            )
+                        });
+                    }
+                }
+            } else if let Some(notice) = update.notice {
+                self.status = notice;
+            }
+        }
         if self.view == View::Practice {
             self.begin_session_recording_if_needed();
         }
@@ -831,14 +1036,14 @@ impl eframe::App for DrumApp {
                 self.metronome.reset();
                 if self.metronome_enabled {
                     for event in self.metronome.observe(transport) {
-                        self.click_audio.play(event.kind);
+                        let _ = self.audio_output.play_click(event.kind);
                     }
                 } else {
                     self.metronome.sync_to_transport(transport);
                 }
             } else if self.metronome_enabled || self.count_in_active {
                 for event in self.metronome.observe(transport) {
-                    self.click_audio.play(event.kind);
+                    let _ = self.audio_output.play_click(event.kind);
                 }
             } else {
                 self.metronome.sync_to_transport(transport);
@@ -884,89 +1089,6 @@ impl eframe::App for DrumApp {
             self.persist_completed_session();
         }
 
-        if false {
-            egui::TopBottomPanel::top("legacy_header").show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.heading("MIDI Drum Practice");
-                ui.label("Phase 2 - Setup wizard & drum mapping");
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Refresh devices").clicked() {
-                        self.refresh_devices();
-                    }
-
-                    let selected_text = self
-                        .ports
-                        .get(self.selected.unwrap_or(usize::MAX))
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "Select a MIDI input...".to_string());
-                    egui::ComboBox::from_id_salt("device_combo")
-                        .width(320.0)
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            if self.ports.is_empty() {
-                                ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
-                            }
-                            for p in &self.ports {
-                                ui.selectable_value(&mut self.selected, Some(p.index), &p.name);
-                            }
-                        });
-
-                    if self.connected {
-                        if ui.button("Disconnect").clicked() {
-                            self.disconnect_clicked();
-                        }
-                    } else {
-                        let can_connect = self.selected.is_some() && !self.ports.is_empty();
-                        if ui
-                            .add_enabled(can_connect, egui::Button::new("Connect"))
-                            .clicked()
-                        {
-                            self.connect_clicked();
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.view, View::Monitor, "Monitor");
-                    ui.selectable_value(&mut self.view, View::Setup, "Setup Wizard");
-                    ui.selectable_value(&mut self.view, View::TrackLibrary, "Import MIDI");
-                });
-                ui.add_space(4.0);
-                if self.connected {
-                    let mapping_line = match &self.active_config {
-                        Some(cfg) => format!(
-                            "Drum mapping for {}: {}/{} components configured.",
-                            cfg.device_name,
-                            cfg.mapped_component_count(),
-                            SUPPORTED_COMPONENTS.len()
-                        ),
-                        None => "No drum mapping loaded for this device yet.".to_string(),
-                    };
-                    ui.weak(mapping_line);
-                }
-                ui.add_space(2.0);
-                ui.label(format!(
-                    "Available MIDI input devices: {} | {}",
-                    self.ports.len(),
-                    if self.status.is_empty() {
-                        if self.connected {
-                            format!(
-                                "Listening on {}",
-                                self.backend.connected_port_name().unwrap_or("?")
-                            )
-                        } else {
-                            "Idle - select a device and press Connect.".to_string()
-                        }
-                    } else {
-                        self.status.clone()
-                    }
-                ));
-                ui.add_space(4.0);
-                ui.separator();
-            });
-        }
-
         let mut import_midi = false;
         let mut restart = false;
         let mut start_resume = false;
@@ -977,14 +1099,14 @@ impl eframe::App for DrumApp {
         let mut disconnect_midi_device = false;
         egui::TopBottomPanel::top("application_menu")
             .frame(egui::Frame::default()
-                .fill(egui::Color32::from_rgb(24, 24, 24))
+                .fill(ctx.style().visuals.window_fill)
                 .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(55)))
                 .inner_margin(egui::Margin::symmetric(10, 5)))
             .show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("MIDI Drum Practice")
+                    egui::RichText::new("MI Drums")
                         .strong()
                         .size(20.0),
                 );
@@ -1005,9 +1127,50 @@ impl eframe::App for DrumApp {
                 });
                 ui.menu_button("Practice", |ui| {
                     let available = self.transport.is_some() && self.practice_session.is_some();
-                    if ui.add_enabled(available,egui::Button::new("Practice Timeline")).clicked(){self.practice_visual=PracticeVisual::Timeline;self.save_practice_settings();self.view=View::Practice;ui.close_menu();}
-                    if ui.add_enabled(self.current_library_path.is_some(),egui::Button::new("Performance Analysis")).clicked(){self.analysis_track_path=self.current_library_path.clone();self.analysis_session_id=None;self.view=View::PerformanceAnalysis;ui.close_menu();}
-                    if ui.add_enabled(self.current_library_path.is_some(),egui::Button::new("Progress")).clicked(){if let Some(track)=self.current_library_path.clone(){match self.session_store.load_for_track(&track){Ok(sessions)=>{self.progress_data=Some(drums_core::TrackProgress::from_sessions(&sessions));self.progress_track_path=Some(track);self.view=View::Progress;}Err(error)=>self.status=format!("Could not load progress: {error}"),}}ui.close_menu();}
+                    if ui
+                        .add_enabled(available, egui::Button::new("Practice Timeline"))
+                        .clicked()
+                    {
+                        self.practice_visual = PracticeVisual::Timeline;
+                        let _ = self.save_practice_settings();
+                        self.view = View::Practice;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.current_library_path.is_some(),
+                            egui::Button::new("Performance Analysis"),
+                        )
+                        .clicked()
+                    {
+                        self.analysis_track_path = self.current_library_path.clone();
+                        self.analysis_session_id = None;
+                        self.view = View::PerformanceAnalysis;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.current_library_path.is_some(),
+                            egui::Button::new("Progress"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(track) = self.current_library_path.clone() {
+                            match self.session_store.load_for_track(&track) {
+                                Ok(sessions) => {
+                                    self.progress_data = Some(
+                                        drums_core::TrackProgress::from_sessions(&sessions),
+                                    );
+                                    self.progress_track_path = Some(track);
+                                    self.view = View::Progress;
+                                }
+                                Err(error) => {
+                                    self.status = format!("Could not load progress: {error}")
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui
                         .add_enabled(available, egui::Button::new("Restart"))
@@ -1038,43 +1201,68 @@ impl eframe::App for DrumApp {
                 });
                 ui.menu_button("Settings", |ui| {
                     ui.strong("View");
-                    let previous_view=self.practice_visual;
-                    ui.selectable_value(&mut self.practice_visual,PracticeVisual::Timeline,"Timeline");
-                    ui.selectable_value(&mut self.practice_visual,PracticeVisual::SheetMusic,"Sheet Music");
-                    if self.practice_visual!=previous_view{self.save_practice_settings();}
+                    let previous_view = self.practice_visual;
+                    ui.selectable_value(
+                        &mut self.practice_visual,
+                        PracticeVisual::Timeline,
+                        "Timeline",
+                    );
+                    ui.selectable_value(
+                        &mut self.practice_visual,
+                        PracticeVisual::SheetMusic,
+                        "Sheet Music",
+                    );
+                    if self.practice_visual != previous_view {
+                        let _ = self.save_practice_settings();
+                    }
                     ui.separator();
                     ui.strong("Practice / Timing");
-                    let mut timing_settings_changed=false;
-                    ui.horizontal(|ui| { ui.label("MIDI Input Latency").on_hover_text("Compensates for delay between a physical drum hit and MIDI reception."); timing_settings_changed|=ui.add(egui::DragValue::new(&mut self.midi_input_latency_ms).range(0.0..=500.0).suffix(" ms")).changed(); });
-                    ui.horizontal(|ui| { ui.label("Audio Sync Offset").on_hover_text("Shifts backing-track playback relative to the MIDI timeline."); timing_settings_changed|=ui.add(egui::DragValue::new(&mut self.audio_sync_offset_ms).range(-1000.0..=1000.0).suffix(" ms")).changed(); });
-                    if timing_settings_changed { self.save_practice_settings(); if let Some(transport)=self.transport.as_ref(){let p=drums_core::audio_position(transport.elapsed_seconds(),self.audio_sync_offset_ms,self.backing_audio.duration());let _=self.backing_audio.seek(p);} }
+                    let mut timing_settings_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("MIDI Input Latency").on_hover_text(
+                            "Compensates for delay between a physical drum hit and MIDI reception.",
+                        );
+                        timing_settings_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.midi_input_latency_ms)
+                                    .range(0.0..=500.0)
+                                    .suffix(" ms"),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Audio Sync Offset").on_hover_text(
+                            "Shifts backing-track playback relative to the MIDI timeline.",
+                        );
+                        timing_settings_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.audio_sync_offset_ms)
+                                    .range(-1000.0..=1000.0)
+                                    .suffix(" ms"),
+                            )
+                            .changed();
+                    });
+                    if timing_settings_changed {
+                        let _ = self.save_practice_settings();
+                        self.resync_backing_audio();
+                    }
                     ui.weak("Timing tolerance remains the note-matching window; these values do not change it.");
                     ui.separator();
                     if ui.button("MIDI Monitor").clicked() {
-                        if let Some(transport) = self.transport.as_mut() {
-                            transport.pause();
-                            self.metronome.sync_to_transport(transport);
-                        }
-                        self.view = View::Monitor;
-                        self.backing_audio.stop();
+                        self.navigate_away_from_practice(View::Monitor);
                         ui.close_menu();
                     }
                     if ui.button("Setup Wizard").clicked() {
-                        if let Some(transport) = self.transport.as_mut() {
-                            transport.pause();
-                            self.metronome.sync_to_transport(transport);
-                        }
-                        self.view = View::Setup;
-                        self.backing_audio.stop();
+                        self.navigate_away_from_practice(View::Setup);
                         ui.close_menu();
                     }
                     if ui.button("Drum Mapping").clicked() {
-                        if let Some(transport) = self.transport.as_mut() {
-                            transport.pause();
-                            self.metronome.sync_to_transport(transport);
-                        }
-                        self.view = View::Mapping;
-                        self.backing_audio.stop();
+                        self.navigate_away_from_practice(View::Mapping);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Preferences").clicked() {
+                        self.navigate_away_from_practice(View::Preferences);
                         ui.close_menu();
                     }
                 });
@@ -1185,12 +1373,7 @@ impl eframe::App for DrumApp {
             self.stop_practice();
         }
         if go_tracks {
-            if let Some(transport) = self.transport.as_mut() {
-                transport.pause();
-                self.metronome.sync_to_transport(transport);
-            }
-            self.view = View::TrackLibrary;
-            self.backing_audio.stop();
+            self.navigate_away_from_practice(View::TrackLibrary);
         }
         if refresh_midi_devices {
             self.refresh_devices();
@@ -1204,7 +1387,7 @@ impl eframe::App for DrumApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(27, 27, 27))
+                    .fill(ctx.style().visuals.panel_fill)
                     .inner_margin(egui::Margin::same(10)),
             )
             .show(ctx, |ui| {
@@ -1226,13 +1409,15 @@ impl eframe::App for DrumApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            if matches!(self.view, View::Monitor | View::Setup | View::Mapping)
-                                && settings_back_button(self, ui)
+                            if matches!(
+                                self.view,
+                                View::Monitor | View::Setup | View::Mapping | View::Preferences
+                            ) && settings_back_button(self, ui)
                             {
                                 return;
                             }
                             match self.view {
-                                View::Monitor => show_monitor_ui(self, ui),
+                                View::Monitor => monitor_ui::show(self, ui),
                                 View::Setup => wizard_ui::show(self, ui),
                                 View::Mapping => mapping_ui::show(self, ui),
                                 View::TrackLibrary => midi_file_ui::show(self, ui),
@@ -1241,6 +1426,7 @@ impl eframe::App for DrumApp {
                                 }
                                 View::Progress => progress_ui::show(self, ui),
                                 View::SheetMusic => notation_ui::show(self, ui),
+                                View::Preferences => preferences_ui::show(self, ui),
                                 View::Practice => unreachable!(),
                             }
                         });
@@ -1257,6 +1443,7 @@ impl eframe::App for DrumApp {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+        ctx.request_repaint_after(AUDIO_OUTPUT_REFRESH_INTERVAL);
     }
 }
 
@@ -1280,125 +1467,58 @@ fn settings_back_button(app: &mut DrumApp, ui: &mut egui::Ui) -> bool {
     }
 }
 
-/// Phase 1 live MIDI monitor view (unchanged behaviour, moved into the tab).
-fn show_monitor_ui(app: &mut DrumApp, ui: &mut egui::Ui) {
-    ui.add_space(4.0);
-    ui.heading("MIDI Monitor");
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("Refresh devices").clicked() {
-            app.refresh_devices();
-        }
-        let selected_text = app
-            .ports
-            .get(app.selected.unwrap_or(usize::MAX))
-            .map(|port| port.name.clone())
-            .unwrap_or_else(|| "Select a MIDI input...".to_string());
-        egui::ComboBox::from_id_salt("monitor_device_combo")
-            .width(320.0)
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                if app.ports.is_empty() {
-                    ui.add_enabled(false, egui::Label::new("No MIDI devices found"));
-                }
-                for port in &app.ports {
-                    ui.selectable_value(&mut app.selected, Some(port.index), &port.name);
-                }
-            });
-        if app.connected {
-            if ui.button("Disconnect").clicked() {
-                app.disconnect_clicked();
-            }
-        } else if ui
-            .add_enabled(
-                app.selected.is_some() && !app.ports.is_empty(),
-                egui::Button::new("Connect"),
-            )
-            .clicked()
-        {
-            app.connect_clicked();
-        }
-    });
-    if !app.status.is_empty() {
-        ui.weak(&app.status);
-    }
-    ui.separator();
-    ui.heading("Latest event");
-    ui.separator();
-
-    if let Some(latest) = app.events.first() {
-        egui::Grid::new("latest_grid")
-            .num_columns(2)
-            .spacing([24.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Message type");
-                ui.monospace(latest.message.kind.name());
-                ui.end_row();
-                ui.label("MIDI note number");
-                ui.monospace(fmt_opt(latest.message.note()));
-                ui.end_row();
-                ui.label("Velocity");
-                ui.monospace(fmt_opt(latest.message.velocity()));
-                ui.end_row();
-                ui.label("CC controller");
-                ui.monospace(
-                    if latest.message.kind == drums_core::MessageKind::ControlChange {
-                        fmt_opt(latest.message.data1)
-                    } else {
-                        "N/A".into()
-                    },
-                );
-                ui.end_row();
-                ui.label("CC value");
-                ui.monospace(
-                    if latest.message.kind == drums_core::MessageKind::ControlChange {
-                        fmt_opt(latest.message.data2)
-                    } else {
-                        "N/A".into()
-                    },
-                );
-                ui.end_row();
-                ui.label("MIDI channel");
-                ui.monospace(fmt_opt(latest.message.channel_number()));
-                ui.end_row();
-                ui.label("Timestamp");
-                ui.monospace(timestamp_text(latest.timestamp_micros));
-                ui.end_row();
-            });
-    } else {
-        ui.weak("No MIDI events yet. Connect a device and hit a pad.");
-    }
-
-    ui.add_space(12.0);
-    ui.heading(format!("Event log ({})", app.events.len()));
-    ui.separator();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for ev in &app.events {
-                ui.monospace(fmt_event(ev));
-            }
-        });
+fn accent_color(preference: AccentColour) -> egui::Color32 {
+    let (red, green, blue) = preference.rgb();
+    egui::Color32::from_rgb(red, green, blue)
 }
 
-/// Applies a dark theme for a serious, low-distraction look.
-fn set_app_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals.dark_mode = true;
-    style.visuals.override_text_color = Some(egui::Color32::from_rgb(220, 222, 218));
+fn apply_app_appearance(
+    ctx: &egui::Context,
+    theme: ThemePreference,
+    accent: AccentColour,
+    ui_scale: UiScale,
+) {
+    ctx.set_theme(match theme {
+        ThemePreference::System => egui::ThemePreference::System,
+        ThemePreference::Dark => egui::ThemePreference::Dark,
+        ThemePreference::Light => egui::ThemePreference::Light,
+    });
+    ctx.set_zoom_factor(ui_scale.zoom_factor());
+    let accent = accent_color(accent);
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.visuals = egui::Visuals::dark();
+        style.visuals.override_text_color = Some(egui::Color32::from_rgb(220, 222, 218));
+        style.visuals.panel_fill = egui::Color32::from_rgb(27, 27, 27);
+        style.visuals.window_fill = egui::Color32::from_rgb(24, 24, 24);
+        style.visuals.faint_bg_color = egui::Color32::from_rgb(22, 25, 29);
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(17, 22, 29);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(55));
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(55, 55, 55);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(68, 68, 68);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(76, 76, 76);
+        configure_shared_style(style, accent);
+    });
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        style.visuals = egui::Visuals::light();
+        style.visuals.panel_fill = egui::Color32::from_rgb(242, 243, 245);
+        style.visuals.window_fill = egui::Color32::from_rgb(248, 248, 249);
+        style.visuals.faint_bg_color = egui::Color32::from_rgb(232, 235, 239);
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(220, 224, 230);
+        configure_shared_style(style, accent);
+    });
+}
+
+fn configure_shared_style(style: &mut egui::Style, accent: egui::Color32) {
     style.spacing.interact_size = egui::vec2(40.0, 28.0);
     style.spacing.button_padding = egui::vec2(9.0, 5.0);
     style.spacing.item_spacing = egui::vec2(7.0, 6.0);
     style.spacing.window_margin = egui::Margin::same(10);
-    style.visuals.panel_fill = egui::Color32::from_rgb(27, 27, 27);
-    style.visuals.window_fill = egui::Color32::from_rgb(24, 24, 24);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(22, 25, 29);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(17, 22, 29);
-    style.visuals.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(55));
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(55, 55, 55);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(68, 68, 68);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(76, 76, 76);
+    style.visuals.selection.bg_fill = accent;
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.hyperlink_color = accent;
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent);
     style
         .text_styles
         .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
@@ -1408,18 +1528,6 @@ fn set_app_style(ctx: &egui::Context) {
     style
         .text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(21.0));
-    ctx.set_style(style);
-}
-
-fn fmt_opt(value: Option<u8>) -> String {
-    match value {
-        Some(v) => v.to_string(),
-        None => "N/A".to_string(),
-    }
-}
-
-fn timestamp_text(us: u64) -> String {
-    format!("{} us (~{:.3} s)", us, us as f64 / 1_000_000.0)
 }
 
 fn unix_time_millis() -> u64 {
@@ -1430,25 +1538,36 @@ fn unix_time_millis() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn needs_initial_setup(configs: &[DrumKitConfiguration]) -> bool {
-    !configs.iter().any(DrumKitConfiguration::is_usable)
+fn sole_port_index(ports: &[PortInfo]) -> Option<usize> {
+    match ports {
+        [only_port] => Some(only_port.index),
+        _ => None,
+    }
 }
 
-fn fmt_event(ev: &MidiEvent) -> String {
-    format!(
-        "{:>12} us  {:<17} ch={:<4} data1={:<5} data2={:<4}",
-        ev.timestamp_micros,
-        ev.message.kind.name(),
-        fmt_opt(ev.message.channel_number()),
-        fmt_opt(ev.message.data1),
-        fmt_opt(ev.message.data2),
-    )
+fn needs_initial_setup(configs: &[DrumKitConfiguration]) -> bool {
+    !configs.iter().any(DrumKitConfiguration::is_usable)
 }
 
 #[cfg(test)]
 mod startup_tests {
     use super::*;
     use drums_core::mapping::{DrumComponent, DrumMapping};
+
+    #[test]
+    fn midi_port_auto_selection_is_safe_for_empty_and_ambiguous_lists() {
+        let port = |index, name: &str| PortInfo {
+            index,
+            name: name.to_string(),
+        };
+
+        assert_eq!(sole_port_index(&[]), None);
+        assert_eq!(sole_port_index(&[port(7, "only")]), Some(7));
+        assert_eq!(
+            sole_port_index(&[port(1, "first"), port(2, "second")]),
+            None
+        );
+    }
 
     #[test]
     fn first_launch_requires_setup_until_a_playable_mapping_exists() {
@@ -1458,7 +1577,7 @@ mod startup_tests {
         cc_only
             .add_input(DrumMapping {
                 component: DrumComponent::HiHatPedalPosition,
-                event_kind: MappingEventKind::ControlChange,
+                event_kind: drums_core::MappingEventKind::ControlChange,
                 midi_note: 19,
                 channel: 10,
                 articulation: None,
@@ -1471,7 +1590,7 @@ mod startup_tests {
         playable
             .add_input(DrumMapping {
                 component: DrumComponent::Snare,
-                event_kind: MappingEventKind::Note,
+                event_kind: drums_core::MappingEventKind::Note,
                 midi_note: 38,
                 channel: 10,
                 articulation: None,

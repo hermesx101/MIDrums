@@ -12,6 +12,13 @@ const RESULT_WRONG_DRUM: egui::Color32 = egui::Color32::from_rgb(244, 82, 118);
 const RESULT_MISSED: egui::Color32 = egui::Color32::from_rgb(120, 124, 135);
 const RESULT_EXTRA: egui::Color32 = egui::Color32::from_rgb(165, 105, 220);
 
+#[derive(Clone, Copy)]
+struct StaffGeometry {
+    top: f32,
+    spacing: f32,
+    zoom: f32,
+}
+
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let Some(score) = app.notation_score.clone() else {
         ui.heading("DRUM SHEET MUSIC");
@@ -170,6 +177,7 @@ fn render_system(
     let right = rect.right() - 12.0 * zoom;
     let top = rect.top() + 48.0 * zoom;
     let spacing = 13.0 * zoom;
+    let staff = StaffGeometry { top, spacing, zoom };
     for line in 0..5 {
         let y = top + line as f32 * spacing;
         p.line_segment(
@@ -237,11 +245,9 @@ fn render_system(
                 draw_chord(
                     &p,
                     x,
-                    top,
-                    spacing,
+                    staff,
                     &slot.notes,
                     slot.value,
-                    zoom,
                     results.map(|r| (r, slot.tick, score.grid_ticks)),
                 );
             }
@@ -308,33 +314,32 @@ fn render_system(
 fn draw_chord(
     p: &egui::Painter,
     x: f32,
-    top: f32,
-    spacing: f32,
+    staff: StaffGeometry,
     notes: &[NotationDrumNote],
     value: RhythmicValue,
-    zoom: f32,
     feedback: Option<(&[PracticeResult], u64, u64)>,
 ) {
     let mut ys = notes
         .iter()
-        .map(|n| staff_y(n.component, top, spacing))
+        .map(|n| staff_y(n.component, staff.top, staff.spacing))
         .collect::<Vec<_>>();
     ys.sort_by(|a, b| a.total_cmp(b));
-    for (note, y) in notes
-        .iter()
-        .zip(notes.iter().map(|n| staff_y(n.component, top, spacing)))
-    {
+    for (note, y) in notes.iter().zip(
+        notes
+            .iter()
+            .map(|n| staff_y(n.component, staff.top, staff.spacing)),
+    ) {
         let color = feedback
             .and_then(|(r, t, g)| note_feedback(r, t, g, note.component))
             .unwrap_or(egui::Color32::WHITE);
-        draw_head(p, egui::pos2(x, y), note.component, zoom, color);
+        draw_head(p, egui::pos2(x, y), note.component, staff.zoom, color);
     }
-    let stem_top = ys.first().copied().unwrap_or(top) - 25.0 * zoom;
-    let stem_bottom = ys.last().copied().unwrap_or(top);
+    let stem_top = ys.first().copied().unwrap_or(staff.top) - 25.0 * staff.zoom;
+    let stem_bottom = ys.last().copied().unwrap_or(staff.top);
     p.line_segment(
         [
-            egui::pos2(x + 5.0 * zoom, stem_bottom),
-            egui::pos2(x + 5.0 * zoom, stem_top),
+            egui::pos2(x + 5.0 * staff.zoom, stem_bottom),
+            egui::pos2(x + 5.0 * staff.zoom, stem_top),
         ],
         egui::Stroke::new(1.2_f32, egui::Color32::WHITE),
     );
@@ -345,11 +350,11 @@ fn draw_chord(
         _ => 0,
     };
     for i in 0..flags {
-        let y = stem_top + i as f32 * 6.0 * zoom;
+        let y = stem_top + i as f32 * 6.0 * staff.zoom;
         p.line_segment(
             [
-                egui::pos2(x + 5.0 * zoom, y),
-                egui::pos2(x + 14.0 * zoom, y + 7.0 * zoom),
+                egui::pos2(x + 5.0 * staff.zoom, y),
+                egui::pos2(x + 14.0 * staff.zoom, y + 7.0 * staff.zoom),
             ],
             egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
         );

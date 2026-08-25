@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mapping::{DrumComponent, DrumKitConfiguration, MappingEventKind, MappingInputIdentity};
+use crate::mapping::{DrumComponent, DrumKitConfiguration, MappingEventKind, ObservedMidiInput};
 use crate::midi::{ExpectedNote, MessageKind, MidiEvent, MusicalTransport};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,11 +47,7 @@ impl ActualHit {
         }
         let note = event.message.note()?;
         let channel = event.message.channel?;
-        let component = mapping.resolve(MappingInputIdentity {
-            event_kind: MappingEventKind::Note,
-            number: note,
-            channel: channel + 1,
-        });
+        let component = mapping.resolve_drum_from_midi_event(event);
         let queue_delay_seconds =
             observed_at_micros.saturating_sub(event.timestamp_micros) as f64 / 1_000_000.0;
         let elapsed_seconds = (transport.elapsed_seconds() - queue_delay_seconds).max(0.0);
@@ -147,12 +143,29 @@ pub struct PracticeResult {
 
 pub type MatchingConfig = TimingConfig;
 
+/// Latest calibrated value from a configured continuous hi-hat pedal input.
+///
+/// `normalized_position` is deliberately mechanical rather than musical:
+/// `0.0` is the configured range minimum and `1.0` is its maximum. The current
+/// lesson representation does not encode enough articulation information to
+/// infer open/closed scoring semantics from this value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiHatPedalState {
+    pub controller: u8,
+    /// One-based MIDI channel, matching persisted mapping configuration.
+    pub channel: u8,
+    pub raw_value: u8,
+    pub normalized_position: f64,
+    pub timestamp_micros: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PracticeSession {
     expected: Vec<ExpectedNote>,
     consumed: Vec<bool>,
     results: Vec<PracticeResult>,
     config: TimingConfig,
+    hi_hat_pedal_state: Option<HiHatPedalState>,
 }
 
 impl PracticeSession {
@@ -164,6 +177,7 @@ impl PracticeSession {
             consumed,
             results: Vec::new(),
             config,
+            hi_hat_pedal_state: None,
         }
     }
 
@@ -173,6 +187,43 @@ impl PracticeSession {
     pub fn results(&self) -> &[PracticeResult] {
         &self.results
     }
+    pub fn hi_hat_pedal_state(&self) -> Option<HiHatPedalState> {
+        self.hi_hat_pedal_state
+    }
+
+    /// Updates continuous pedal state from the configured hi-hat CC mapping.
+    /// Returns `true` only when the event matched a calibrated pedal-position
+    /// mapping. This method never records a practice hit.
+    pub fn update_hi_hat_pedal_state(
+        &mut self,
+        event: &MidiEvent,
+        configuration: &DrumKitConfiguration,
+    ) -> bool {
+        let Some(input) = ObservedMidiInput::from_event(event) else {
+            return false;
+        };
+        if input.event_kind != MappingEventKind::ControlChange {
+            return false;
+        }
+        let Some(mapping) = configuration.mapping_for_input(input.identity()) else {
+            return false;
+        };
+        if mapping.component != DrumComponent::HiHatPedalPosition {
+            return false;
+        }
+        let Some(range) = mapping.cc_range else {
+            return false;
+        };
+        self.hi_hat_pedal_state = Some(HiHatPedalState {
+            controller: input.number,
+            channel: input.channel,
+            raw_value: input.value,
+            normalized_position: range.normalize(input.value),
+            timestamp_micros: event.timestamp_micros,
+        });
+        true
+    }
+
     pub fn pending_count(&self) -> usize {
         self.consumed.iter().filter(|value| !**value).count()
     }
@@ -472,7 +523,7 @@ fn timing_difference_micros(expected: u64, actual: u64, transport: &MusicalTrans
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::DrumMapping;
+    use crate::mapping::{CcRange, DrumMapping, MappingEventKind};
     use crate::midi::{MidiMessage, MidiTiming, TempoEvent};
 
     fn transport() -> MusicalTransport {
@@ -870,6 +921,127 @@ mod tests {
         };
         assert!(ActualHit::from_midi_event(&pedal_position, &mapping, &t).is_none());
     }
+
+    #[test]
+    fn continuous_hihat_cc_updates_state_without_creating_hits() {
+        let transport = transport();
+        let mut mapping = DrumKitConfiguration::new("continuous pedal");
+        mapping
+            .add_input(DrumMapping {
+                component: DrumComponent::HiHatPedalPosition,
+                event_kind: MappingEventKind::ControlChange,
+                midi_note: 4,
+                channel: 10,
+                articulation: None,
+                cc_range: Some(CcRange::new(20, 120)),
+            })
+            .unwrap();
+        let cc = |controller, value, timestamp_micros| MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::ControlChange,
+                channel: Some(9),
+                data1: Some(controller),
+                data2: Some(value),
+                system_exclusive: None,
+            },
+            timestamp_micros,
+        };
+        let mut practice = session(vec![expected(Some(DrumComponent::HiHat), 960)]);
+
+        let below = cc(4, 5, 10);
+        assert!(practice.update_hi_hat_pedal_state(&below, &mapping));
+        assert_eq!(
+            practice.hi_hat_pedal_state(),
+            Some(HiHatPedalState {
+                controller: 4,
+                channel: 10,
+                raw_value: 5,
+                normalized_position: 0.0,
+                timestamp_micros: 10,
+            })
+        );
+
+        let middle = cc(4, 70, 20);
+        assert!(practice.update_hi_hat_pedal_state(&middle, &mapping));
+        assert_eq!(
+            practice.hi_hat_pedal_state().unwrap().normalized_position,
+            0.5
+        );
+
+        let above = cc(4, 127, 30);
+        assert!(practice.update_hi_hat_pedal_state(&above, &mapping));
+        let state = practice.hi_hat_pedal_state().unwrap();
+        assert_eq!(state.raw_value, 127);
+        assert_eq!(state.normalized_position, 1.0);
+        assert_eq!(state.timestamp_micros, 30);
+
+        assert!(!practice.update_hi_hat_pedal_state(&cc(11, 64, 40), &mapping));
+        assert_eq!(practice.hi_hat_pedal_state(), Some(state));
+        assert!(ActualHit::from_midi_event(&above, &mapping, &transport).is_none());
+        assert!(practice.results().is_empty());
+        assert_eq!(practice.pending_count(), 1);
+    }
+
+    #[test]
+    fn continuous_state_preserves_note_on_and_discrete_pedal_hits() {
+        let transport = transport();
+        let mut mapping = DrumKitConfiguration::new("hybrid pedal");
+        mapping
+            .add_input(DrumMapping {
+                component: DrumComponent::HiHatPedalPosition,
+                event_kind: MappingEventKind::ControlChange,
+                midi_note: 4,
+                channel: 10,
+                articulation: None,
+                cc_range: Some(CcRange::new(10, 110)),
+            })
+            .unwrap();
+        mapping
+            .add_input(DrumMapping {
+                component: DrumComponent::HiHatPedal,
+                event_kind: MappingEventKind::Note,
+                midi_note: 44,
+                channel: 10,
+                articulation: None,
+                cc_range: None,
+            })
+            .unwrap();
+        let cc = MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::ControlChange,
+                channel: Some(9),
+                data1: Some(4),
+                data2: Some(60),
+                system_exclusive: None,
+            },
+            timestamp_micros: 1,
+        };
+        let note = MidiEvent {
+            message: MidiMessage {
+                kind: MessageKind::NoteOn,
+                channel: Some(9),
+                data1: Some(44),
+                data2: Some(92),
+                system_exclusive: None,
+            },
+            timestamp_micros: 2,
+        };
+        let mut practice = session(vec![expected(Some(DrumComponent::HiHatPedal), 0)]);
+
+        assert!(practice.update_hi_hat_pedal_state(&cc, &mapping));
+        let pedal_state = practice.hi_hat_pedal_state();
+        assert!(!practice.update_hi_hat_pedal_state(&note, &mapping));
+        let hit = ActualHit::from_midi_event(&note, &mapping, &transport).unwrap();
+        assert_eq!(hit.received_midi_note, 44);
+        assert_eq!(hit.velocity, 92);
+        assert_eq!(hit.drum_component, Some(DrumComponent::HiHatPedal));
+        assert_eq!(
+            practice.record_hit(hit, &transport).kind,
+            PracticeResultKind::CorrectHit
+        );
+        assert_eq!(practice.hi_hat_pedal_state(), pedal_state);
+    }
+
     #[test]
     fn callback_timestamp_removes_gui_queue_delay_from_actual_tick() {
         let mut t = transport();

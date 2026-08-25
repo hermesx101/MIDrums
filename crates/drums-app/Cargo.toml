@@ -3,7 +3,7 @@ name = "drums-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Desktop GUI for the DRUMS practice application (Phase 1)."
+description = "Desktop GUI for MI Drums."
 
 [[bin]]
 name = "drums-app"

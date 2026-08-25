@@ -1,6 +1,26 @@
 target/
 *.log
+
+# Local environment files
 .env
 .env.*
+!.env.example
+
+# Application-data fallbacks created when no user config directory is available
+drums-mappings/
+practice-settings.toml
+practice-sessions.toml
+track-library.toml
 session/
+
+# Editors and operating systems
 .vscode/
+.idea/
+.vs/
+*.suo
+*.user
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

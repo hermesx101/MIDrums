@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["DRUMS contributors"]
-description = "Open-source MIDI drum practice application."
+description = "MI Drums — an open-source MIDI drum practice application."
 
 [workspace.dependencies]
 midir = "0.10"

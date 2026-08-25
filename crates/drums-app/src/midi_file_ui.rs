@@ -1,4 +1,6 @@
-//! Phase 3A MIDI-file inspection view. Parsing remains in `drums-core`.
+//! Track Library and Practice views. Parsing and scoring remain in `drums-core`.
+
+use std::collections::BTreeSet;
 
 use crate::{DrumApp, LibrarySort, PracticeLoopMode, PracticeVisual, View};
 use drums_core::{
@@ -14,6 +16,34 @@ const RESULT_LATE: egui::Color32 = egui::Color32::from_rgb(246, 132, 68);
 const RESULT_WRONG_DRUM: egui::Color32 = egui::Color32::from_rgb(244, 82, 118);
 const RESULT_MISSED: egui::Color32 = egui::Color32::from_rgb(120, 124, 135);
 const RESULT_EXTRA: egui::Color32 = egui::Color32::from_rgb(165, 105, 220);
+
+/// Timeline-only cache rebuilt with the active lesson rather than per frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedTimelineDrums {
+    components: BTreeSet<DrumComponent>,
+    has_unknown: bool,
+}
+
+impl ExpectedTimelineDrums {
+    pub(crate) fn from_expected(expected: &[ExpectedNote]) -> Self {
+        Self {
+            components: expected
+                .iter()
+                .filter_map(|note| note.drum_component)
+                .collect(),
+            has_unknown: expected.iter().any(|note| note.drum_component.is_none()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LibraryCardActions {
+    practice_path: Option<String>,
+    analysis_path: Option<String>,
+    sheet_path: Option<String>,
+    rename: Option<(String, String)>,
+    remove: Option<String>,
+}
 
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
@@ -83,49 +113,36 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             .partial_cmp(&a.last_accuracy)
             .unwrap_or(std::cmp::Ordering::Equal),
     });
-    let mut practice_path = None;
-    let mut analysis_path = None;
-    let mut sheet_path = None;
-    let mut rename = None;
-    let mut remove = None;
+    let mut actions = LibraryCardActions::default();
     for entry in &entries {
         ui.push_id(("track_row", &entry.path), |ui| {
             // Bound only the horizontal dimension. Height remains entirely
             // content-driven, and the page-level ScrollArea handles overflow.
             ui.set_width(ui.available_width());
-            library_card(
-                app,
-                ui,
-                entry,
-                &mut practice_path,
-                &mut analysis_path,
-                &mut sheet_path,
-                &mut rename,
-                &mut remove,
-            );
+            library_card(app, ui, entry, &mut actions);
         });
         ui.add_space(8.0);
     }
 
-    if let Some((path, name)) = rename {
+    if let Some((path, name)) = actions.rename {
         app.library_rename_path = Some(path);
         app.library_rename_buffer = name;
     }
-    if let Some(path) = remove {
+    if let Some(path) = actions.remove {
         app.library_remove_path = Some(path);
     }
-    if let Some(path) = practice_path {
+    if let Some(path) = actions.practice_path {
         match app.open_library_entry(&path) {
             Ok(()) => app.view = View::Practice,
             Err(error) => app.midi_import_error = Some(error),
         }
     }
-    if let Some(path) = analysis_path {
+    if let Some(path) = actions.analysis_path {
         app.analysis_track_path = Some(path);
         app.analysis_session_id = None;
         app.view = View::PerformanceAnalysis;
     }
-    if let Some(path) = sheet_path {
+    if let Some(path) = actions.sheet_path {
         if let Err(error) = app.open_sheet_music(&path) {
             app.midi_import_error = Some(error);
         }
@@ -137,26 +154,23 @@ fn library_card(
     app: &mut DrumApp,
     ui: &mut egui::Ui,
     entry: &crate::track_library::LibraryEntry,
-    practice_path: &mut Option<String>,
-    analysis_path: &mut Option<String>,
-    sheet_path: &mut Option<String>,
-    rename: &mut Option<(String, String)>,
-    remove: &mut Option<String>,
+    actions: &mut LibraryCardActions,
 ) {
     let selected = app.library_selected_path.as_deref() == Some(entry.path.as_str());
     let active = app.current_library_path.as_deref() == Some(entry.path.as_str());
+    let card_fill = if selected {
+        ui.visuals().widgets.active.weak_bg_fill
+    } else {
+        ui.visuals().faint_bg_color
+    };
     egui::Frame::group(ui.style())
-        .fill(if selected {
-            egui::Color32::from_rgb(29, 48, 66)
-        } else {
-            egui::Color32::from_rgb(22, 28, 38)
-        })
+        .fill(card_fill)
         .stroke(egui::Stroke::new(
             if selected { 2.0_f32 } else { 1.0_f32 },
             if selected {
-                egui::Color32::from_rgb(90, 175, 230)
+                app.accent_color()
             } else {
-                egui::Color32::from_gray(55)
+                ui.visuals().widgets.noninteractive.bg_stroke.color
             },
         ))
         .inner_margin(12.0)
@@ -175,15 +189,7 @@ fn library_card(
                     app.library_selected_path = Some(entry.path.clone());
                 }
                 title.on_hover_text("Select track");
-                library_card_menu(
-                    ui,
-                    entry,
-                    practice_path,
-                    analysis_path,
-                    sheet_path,
-                    rename,
-                    remove,
-                );
+                library_card_menu(ui, entry, actions);
             });
 
             ui.add_space(6.0);
@@ -235,13 +241,13 @@ fn library_card(
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Practice  >").clicked() {
-                    *practice_path = Some(entry.path.clone());
+                    actions.practice_path = Some(entry.path.clone());
                 }
                 if ui.button("Performance Analysis").clicked() {
-                    *analysis_path = Some(entry.path.clone());
+                    actions.analysis_path = Some(entry.path.clone());
                 }
                 if ui.button("Sheet Music").clicked() {
-                    *sheet_path = Some(entry.path.clone());
+                    actions.sheet_path = Some(entry.path.clone());
                 }
                 egui::CollapsingHeader::new("Details")
                     .default_open(false)
@@ -270,31 +276,27 @@ fn library_card(
 fn library_card_menu(
     ui: &mut egui::Ui,
     entry: &crate::track_library::LibraryEntry,
-    practice_path: &mut Option<String>,
-    analysis_path: &mut Option<String>,
-    sheet_path: &mut Option<String>,
-    rename: &mut Option<(String, String)>,
-    remove: &mut Option<String>,
+    actions: &mut LibraryCardActions,
 ) {
     ui.menu_button("...", |ui| {
         if ui.button("Practice").clicked() {
-            *practice_path = Some(entry.path.clone());
+            actions.practice_path = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Performance Analysis").clicked() {
-            *analysis_path = Some(entry.path.clone());
+            actions.analysis_path = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Sheet Music").clicked() {
-            *sheet_path = Some(entry.path.clone());
+            actions.sheet_path = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Rename").clicked() {
-            *rename = Some((entry.path.clone(), entry.display_name.clone()));
+            actions.rename = Some((entry.path.clone(), entry.display_name.clone()));
             ui.close_menu();
         }
         if ui.button("Remove from Library").clicked() {
-            *remove = Some(entry.path.clone());
+            actions.remove = Some(entry.path.clone());
             ui.close_menu();
         }
         if ui.button("Show File Location").clicked() {
@@ -355,190 +357,6 @@ fn library_edit_prompts(app: &mut DrumApp, ui: &mut egui::Ui) {
                 app.library_remove_path = None;
             }
         });
-    }
-}
-
-#[allow(dead_code)]
-fn show_card_legacy(app: &mut DrumApp, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.horizontal_centered(|ui| {
-        ui.heading("TRACK LIBRARY");
-        if ui.button("+ Import MIDI").clicked() {
-            app.import_midi_clicked();
-        }
-    });
-    if let Some(error) = &app.midi_import_error {
-        ui.colored_label(egui::Color32::from_rgb(240, 120, 120), error);
-    }
-    let Some(file) = app.imported_midi.as_ref() else {
-        ui.add_space(16.0);
-        ui.label("Import a .mid or .midi file to add it to the library.");
-        return;
-    };
-    let filename = file.filename.clone();
-    let bpm = file.tempo_events.first().map(|tempo| tempo.bpm());
-    let signature = file
-        .time_signature_events
-        .first()
-        .map(|value| format!("{}/{}", value.numerator, value.denominator()));
-    let duration = file.duration_seconds;
-    let mut selected_changed = false;
-    let mut enter_practice = false;
-    egui::Frame::group(ui.style())
-        .inner_margin(14.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&filename).strong().size(22.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    enter_practice = ui
-                        .add_enabled(
-                            app.selected_drum_track.is_some(),
-                            egui::Button::new("Practice"),
-                        )
-                        .clicked();
-                });
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.weak(
-                    bpm.map(|value| format!("{value:.0} BPM"))
-                        .unwrap_or_else(|| "Tempo not specified".to_string()),
-                );
-                ui.weak("|");
-                ui.weak(signature.unwrap_or_else(|| "Time signature not specified".to_string()));
-                ui.weak("|");
-                ui.weak(
-                    duration
-                        .map(duration_text)
-                        .unwrap_or_else(|| "Duration unavailable".to_string()),
-                );
-            });
-            ui.add_space(8.0);
-            ui.strong("Tracks");
-            for track in &file.tracks {
-                let title = track.name.as_deref().unwrap_or("Unnamed track");
-                selected_changed |= ui
-                    .selectable_value(
-                        &mut app.selected_drum_track,
-                        Some(track.index),
-                        format!("{} - {} notes", title, track.note_event_count),
-                    )
-                    .changed();
-            }
-            egui::CollapsingHeader::new("Details")
-                .default_open(false)
-                .show(ui, |ui| {
-                    metadata(ui, file);
-                    if let Some(track) = app.selected_drum_track {
-                        let expected =
-                            file.expected_notes_for_track(track, app.active_config.as_ref());
-                        egui::CollapsingHeader::new("Inspect MIDI Events")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                midi_event_table(ui, &expected);
-                            });
-                    }
-                });
-        });
-    if selected_changed {
-        app.rebuild_timeline();
-    }
-    if enter_practice {
-        if app.practice_session.is_none() {
-            app.rebuild_timeline();
-        }
-        app.view = View::Practice;
-    }
-}
-
-#[allow(dead_code)]
-fn show_legacy(app: &mut DrumApp, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
-    ui.heading("TRACK LIBRARY");
-    ui.horizontal(|ui| {
-        if ui.button("Import MIDI...").clicked() {
-            app.import_midi_clicked();
-        }
-    });
-    if let Some(error) = &app.midi_import_error {
-        ui.add_space(8.0);
-        ui.colored_label(egui::Color32::from_rgb(240, 120, 120), error);
-    }
-    let Some(file) = app.imported_midi.as_ref() else {
-        ui.add_space(12.0);
-        ui.heading("Import a MIDI track");
-        ui.separator();
-        ui.label("Choose a .mid or .midi file to inspect its tracks and drum events.");
-        ui.weak("This view imports and inspects data only; it does not play MIDI files.");
-        return;
-    };
-    let mut selected_track_changed = false;
-    egui::CollapsingHeader::new("MIDI File / Track Selection").show(ui, |ui| {
-        metadata(ui, file);
-        ui.add_space(8.0);
-        ui.strong("TRACKS");
-        for track in &file.tracks {
-            let title = format!(
-                "Track {} - {}  ({} events, {} notes, channels: {}){}",
-                track.index + 1,
-                track.name.as_deref().unwrap_or("Unnamed"),
-                track.event_count,
-                track.note_event_count,
-                channels(&track.channels),
-                if track.likely_drum {
-                    "  * likely drums"
-                } else {
-                    ""
-                }
-            );
-            selected_track_changed |= ui
-                .selectable_value(&mut app.selected_drum_track, Some(track.index), title)
-                .changed();
-        }
-        if file.suggested_drum_track().is_none() {
-            ui.weak("No obvious drum track was detected. Select a track to inspect manually.");
-        } else {
-            ui.weak("Likely drum tracks are suggestions; choose any track to override them.");
-        }
-    });
-    let Some(selected_track) = app.selected_drum_track else {
-        ui.weak("Select a track above.");
-        return;
-    };
-    let expected = file.expected_notes_for_track(selected_track, app.active_config.as_ref());
-    let enter_practice = ui
-        .add_enabled(
-            !expected.is_empty(),
-            egui::Button::new("Practice Selected Track"),
-        )
-        .clicked();
-    if expected.is_empty() {
-        ui.weak("This track contains no Note On events with velocity above zero.");
-        return;
-    }
-    egui::CollapsingHeader::new("Imported MIDI Events").show(ui, |ui| { egui::Grid::new("midi_file_events").striped(true).num_columns(7).spacing([16.0, 4.0]).show(ui, |ui| {
-        ui.strong("Time"); ui.strong("Tick"); ui.strong("MIDI"); ui.strong("Component"); ui.strong("Target"); ui.strong("Velocity"); ui.strong("Channel"); ui.end_row();
-        for event in expected.iter().take(1_000) {
-            ui.monospace(format!("{:.3}s", event.timestamp_seconds));
-            ui.monospace(event.tick.to_string());
-            ui.monospace(event.midi_note.to_string());
-            ui.monospace(event.drum_component.map(|component| component.label()).unwrap_or("Unknown"));
-            ui.monospace(event.target_component.map(|component| component.label()).unwrap_or("Not configured"));
-            ui.monospace(event.velocity.to_string());
-            ui.monospace((event.channel + 1).to_string());
-            ui.end_row();
-        }
-    });
-    if expected.len() > 1_000 { ui.weak(format!("Showing the first 1,000 of {} note events.", expected.len())); }
-    if app.active_config.is_none() { ui.weak("General MIDI components are shown directly. Connect a configured kit to see physical targets."); }
-    });
-    if selected_track_changed {
-        app.rebuild_timeline();
-    }
-    if enter_practice {
-        if app.practice_session.is_none() {
-            app.rebuild_timeline();
-        }
-        app.view = View::Practice;
     }
 }
 
@@ -630,7 +448,7 @@ fn backing_audio_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
             )
             .changed()
         {
-            app.save_practice_settings();
+            let _ = app.save_practice_settings();
         }
         choose_audio = ui.small_button("Replace Audio").clicked();
         remove_audio = ui.small_button("Remove Audio").clicked();
@@ -783,9 +601,13 @@ fn practice_content(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[ExpectedNo
                     transport,
                     expected,
                     results,
-                    app.metronome.subdivision(),
-                    app.practice_lookahead_seconds,
-                    app.active_loop_region(),
+                    RhythmGridOptions {
+                        subdivision: app.metronome.subdivision(),
+                        lookahead_seconds: app.practice_lookahead_seconds,
+                        loop_region: app.active_loop_region(),
+                        expected_drums_only: app.expected_drums_only,
+                        expected_drums: &app.expected_timeline_drums,
+                    },
                 );
             }
             PracticeVisual::SheetMusic => {
@@ -827,7 +649,7 @@ fn practice_metronome_strip(app: &mut DrumApp, ui: &mut egui::Ui) {
     );
     ui.horizontal(|ui| {
         egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgb(18, 27, 37))
+            .fill(ui.visuals().extreme_bg_color)
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -863,6 +685,17 @@ fn practice_metronome_strip(app: &mut DrumApp, ui: &mut egui::Ui) {
                 app.notation_zoom = (app.notation_zoom + 0.1).min(2.0);
             }
             ui.checkbox(&mut app.notation_follow_playback, "Follow Playback");
+        } else {
+            ui.add_space(12.0);
+            ui.separator();
+            if ui
+                .checkbox(&mut app.expected_drums_only, "Expected Drums Only")
+                .changed()
+            {
+                if let Err(error) = app.save_practice_settings() {
+                    app.status = format!("Could not save Practice settings: {error}");
+                }
+            }
         }
     });
 }
@@ -1262,40 +1095,91 @@ fn valid_practice_bpm(value: f64) -> Option<f64> {
     (value.is_finite() && (20.0..=300.0).contains(&value)).then_some(value)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum HeaderLabelPriority {
+    Subdivision,
+    Beat,
+    Bar,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderLabelCandidate {
+    x: f32,
+    width: f32,
+    priority: HeaderLabelPriority,
+    text: String,
+}
+
+/// Selects readable labels without moving them away from their musical x-coordinate.
+fn select_header_labels(
+    candidates: &[HeaderLabelCandidate],
+    left: f32,
+    right: f32,
+    minimum_gap: f32,
+) -> Vec<usize> {
+    let mut priority_order = (0..candidates.len()).collect::<Vec<_>>();
+    priority_order.sort_by(|left_index, right_index| {
+        let left_label = &candidates[*left_index];
+        let right_label = &candidates[*right_index];
+        right_label
+            .priority
+            .cmp(&left_label.priority)
+            .then_with(|| left_label.x.total_cmp(&right_label.x))
+    });
+
+    let mut occupied = Vec::<(f32, f32)>::new();
+    let mut selected = Vec::new();
+    for index in priority_order {
+        let candidate = &candidates[index];
+        // Labels remain left-anchored just after the exact grid/bar boundary.
+        let start = candidate.x + 3.0;
+        let end = start + candidate.width;
+        if start < left || end > right {
+            continue;
+        }
+        let collides = occupied.iter().any(|(other_start, other_end)| {
+            start < *other_end + minimum_gap && end + minimum_gap > *other_start
+        });
+        if !collides {
+            occupied.push((start, end));
+            selected.push(index);
+        }
+    }
+    selected.sort_by(|left_index, right_index| {
+        candidates[*left_index]
+            .x
+            .total_cmp(&candidates[*right_index].x)
+    });
+    selected
+}
+
+#[derive(Clone, Copy)]
+struct RhythmGridOptions<'a> {
+    subdivision: Subdivision,
+    lookahead_seconds: f64,
+    loop_region: Option<(u64, u64)>,
+    expected_drums_only: bool,
+    expected_drums: &'a ExpectedTimelineDrums,
+}
+
 fn rhythm_grid(
     ui: &mut egui::Ui,
     transport: &MusicalTransport,
     expected: &[ExpectedNote],
     results: &[PracticeResult],
-    subdivision: Subdivision,
-    lookahead_seconds: f64,
-    loop_region: Option<(u64, u64)>,
+    options: RhythmGridOptions<'_>,
 ) {
+    let RhythmGridOptions {
+        subdivision,
+        lookahead_seconds,
+        loop_region,
+        expected_drums_only,
+        expected_drums,
+    } = options;
     // Loop iterations reuse musical ticks. Keep the complete result history in
     // drums-core for statistics, but bound visualization work and overlap.
     let results = &results[results.len().saturating_sub(256)..];
-    let mut lanes = vec![
-        Some(DrumComponent::Crash),
-        Some(DrumComponent::Ride),
-        Some(DrumComponent::HiHat),
-        Some(DrumComponent::HiHatOpen),
-        Some(DrumComponent::HiHatPedal),
-        Some(DrumComponent::Snare),
-        Some(DrumComponent::Kick),
-        Some(DrumComponent::HiTom),
-        Some(DrumComponent::MidTom),
-        Some(DrumComponent::LowTom),
-    ];
-    let has_unknown = expected.iter().any(|note| note.drum_component.is_none())
-        || results.iter().any(|result| {
-            result
-                .actual
-                .as_ref()
-                .is_some_and(|hit| hit.drum_component.is_none())
-        });
-    if has_unknown {
-        lanes.push(None);
-    }
+    let lanes = timeline_lanes(expected_drums_only, expected_drums, results);
     // The rhythm grid is the primary practice surface. At compact window
     // sizes it remains usable; on larger displays it receives the extra room.
     let height = (ui.available_height() - 42.0).clamp(320.0, 720.0);
@@ -1310,7 +1194,7 @@ fn rhythm_grid(
     let header_height = 38.0;
     let chart_left = geometry.grid_left;
     let hit_x = geometry.beat_origin;
-    let lane_height = (rect.height() - header_height) / lanes.len() as f32;
+    let lane_height = (rect.height() - header_height) / lanes.len().max(1) as f32;
     let now = transport.elapsed_seconds();
     let past_seconds = 1.5;
     let (window_start, window_end) = visible_time_window(
@@ -1355,7 +1239,7 @@ fn rhythm_grid(
                     egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 175, 220)),
                 );
                 painter.text(
-                    egui::pos2(x + 3.0, rect.top() + 3.0),
+                    egui::pos2(x + 3.0, rect.top() + header_height + 3.0),
                     egui::Align2::LEFT_TOP,
                     label,
                     egui::FontId::monospace(9.0),
@@ -1391,12 +1275,28 @@ fn rhythm_grid(
             color,
         );
     }
+    if lanes.is_empty() {
+        painter.text(
+            egui::pos2(
+                (chart_left + rect.right()) * 0.5,
+                rect.top() + header_height + lane_height * 0.5,
+            ),
+            egui::Align2::CENTER_CENTER,
+            "No expected drums in this lesson",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_gray(145),
+        );
+    }
 
     if let Some(ppq) = transport.position_map().ticks_per_quarter() {
         let step = (ppq as u64 / subdivision.units_per_quarter()).max(1);
         let start_tick = transport.effective_tick_at_seconds((now - past_seconds).max(0.0));
         let end_tick = transport
             .effective_tick_at_seconds((now + lookahead_seconds).min(transport.total_seconds()));
+        let header_font = egui::FontId::monospace(11.0);
+        let header_color = egui::Color32::from_gray(175);
+        let mut bar_labels = Vec::new();
+        let mut musical_labels = Vec::new();
         let mut tick = start_tick - start_tick % step;
         while tick <= end_tick {
             let x = seconds_to_x(transport.effective_seconds_at_tick(tick));
@@ -1432,22 +1332,64 @@ fn rhythm_grid(
                 position.ticks_per_beat,
                 subdivision,
             );
-            let label = if is_bar {
-                format!("Bar {}   {}", position.measure, token)
+            if is_bar {
+                let text = format!("Bar {}", position.measure);
+                let width = painter
+                    .layout_no_wrap(text.clone(), header_font.clone(), header_color)
+                    .size()
+                    .x;
+                bar_labels.push(HeaderLabelCandidate {
+                    x,
+                    width,
+                    priority: HeaderLabelPriority::Bar,
+                    text,
+                });
+            }
+            let priority = if is_beat {
+                HeaderLabelPriority::Beat
             } else {
-                token
+                HeaderLabelPriority::Subdivision
             };
-            painter.text(
-                egui::pos2(x + 3.0, rect.top() + 18.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::monospace(11.0),
-                egui::Color32::from_gray(175),
-            );
+            let width = painter
+                .layout_no_wrap(token.clone(), header_font.clone(), header_color)
+                .size()
+                .x;
+            musical_labels.push(HeaderLabelCandidate {
+                x,
+                width,
+                priority,
+                text: token,
+            });
             tick = tick.saturating_add(step);
             if step == 0 {
                 break;
             }
+        }
+
+        // Bar numbers and musical counts use separate header rows. Within
+        // each row the selector preserves exact x positions and progressively
+        // drops lower-priority subdivision labels when space is constrained.
+        for index in select_header_labels(&bar_labels, chart_left + 1.0, rect.right() - 2.0, 5.0) {
+            let label = &bar_labels[index];
+            painter.text(
+                egui::pos2(label.x + 3.0, rect.top() + 9.0),
+                egui::Align2::LEFT_CENTER,
+                &label.text,
+                header_font.clone(),
+                header_color,
+            );
+        }
+        for index in
+            select_header_labels(&musical_labels, chart_left + 1.0, rect.right() - 2.0, 5.0)
+        {
+            let label = &musical_labels[index];
+            painter.text(
+                egui::pos2(label.x + 3.0, rect.top() + 27.0),
+                egui::Align2::LEFT_CENTER,
+                &label.text,
+                header_font.clone(),
+                header_color,
+            );
         }
     }
 
@@ -1456,7 +1398,9 @@ fn rhythm_grid(
         if seconds < window_start || seconds > window_end {
             continue;
         }
-        let lane = lane_index(note.drum_component, has_unknown);
+        let Some(lane) = lane_index(&lanes, note.drum_component) else {
+            continue;
+        };
         let y = rect.top() + header_height + (lane as f32 + 0.5) * lane_height;
         let x = seconds_to_x(seconds);
         let color = note
@@ -1504,11 +1448,17 @@ fn rhythm_grid(
         let Some(actual) = &result.actual else {
             continue;
         };
+        if !timeline_actual_hit_visible(expected_drums_only, expected_drums, actual.drum_component)
+        {
+            continue;
+        }
         let seconds = transport.effective_seconds_at_tick(actual.transport_tick);
         if seconds < window_start || seconds > window_end {
             continue;
         }
-        let lane = lane_index(actual.drum_component, has_unknown);
+        let Some(lane) = lane_index(&lanes, actual.drum_component) else {
+            continue;
+        };
         let y = rect.top() + header_height + (lane as f32 + 0.5) * lane_height;
         let x = seconds_to_x(seconds);
         let state_color = actual_result_color(result);
@@ -1620,7 +1570,7 @@ fn subdivision_token(
     ticks_per_beat: u64,
     subdivision: Subdivision,
 ) -> String {
-    let units = subdivision.units_per_quarter().max(1) as u64;
+    let units = subdivision.units_per_quarter().max(1);
     let index = (ticks_into_beat.saturating_mul(units) / ticks_per_beat.max(1)) as usize;
     match subdivision {
         Subdivision::Quarter => beat.to_string(),
@@ -1649,15 +1599,49 @@ fn subdivision_long_label(value: Subdivision) -> &'static str {
     }
 }
 
-fn lane_index(component: Option<DrumComponent>, has_unknown: bool) -> usize {
-    DrumComponent::ALL
-        .iter()
-        .position(|value| Some(*value) == component)
-        .unwrap_or(if has_unknown {
-            DrumComponent::ALL.len()
-        } else {
-            DrumComponent::ALL.len() - 1
-        })
+fn timeline_lanes(
+    expected_drums_only: bool,
+    expected_drums: &ExpectedTimelineDrums,
+    results: &[PracticeResult],
+) -> Vec<Option<DrumComponent>> {
+    if expected_drums_only {
+        let mut lanes = DrumComponent::ALL
+            .into_iter()
+            .filter(|component| expected_drums.components.contains(component))
+            .map(Some)
+            .collect::<Vec<_>>();
+        if expected_drums.has_unknown {
+            lanes.push(None);
+        }
+        return lanes;
+    }
+
+    let mut lanes = DrumComponent::ALL.into_iter().map(Some).collect::<Vec<_>>();
+    let has_unknown_actual = results.iter().any(|result| {
+        result
+            .actual
+            .as_ref()
+            .is_some_and(|hit| hit.drum_component.is_none())
+    });
+    if expected_drums.has_unknown || has_unknown_actual {
+        lanes.push(None);
+    }
+    lanes
+}
+
+fn timeline_actual_hit_visible(
+    expected_drums_only: bool,
+    expected_drums: &ExpectedTimelineDrums,
+    component: Option<DrumComponent>,
+) -> bool {
+    !expected_drums_only
+        || component
+            .map(|component| expected_drums.components.contains(&component))
+            .unwrap_or(expected_drums.has_unknown)
+}
+
+fn lane_index(lanes: &[Option<DrumComponent>], component: Option<DrumComponent>) -> Option<usize> {
+    lanes.iter().position(|lane| *lane == component)
 }
 
 fn visible_time_window(
@@ -1845,309 +1829,6 @@ fn practice_debug_details(app: &DrumApp, ui: &mut egui::Ui) {
         });
 }
 
-#[allow(dead_code)]
-fn transport_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
-    let Some(transport) = app.transport.as_mut() else {
-        return;
-    };
-    if let Some(since) = app.displayed_result_since {
-        ui.ctx().request_repaint_after(
-            std::time::Duration::from_millis(1_200).saturating_sub(since.elapsed()),
-        );
-    }
-    ui.add_space(8.0);
-    ui.heading("PRACTICE");
-
-    if let Some(session) = &app.practice_session {
-        let performance = PracticePerformance::from_session(session);
-        let total = session.matchable_count();
-        let completed = session.finalized_matchable_count();
-        let target = session.current_target(transport.current_tick(), transport);
-        let state = if target.is_none() && total > 0 && completed == total {
-            "SONG COMPLETE"
-        } else {
-            match transport.state() {
-                TransportState::Playing => "PLAYING",
-                TransportState::Paused => "PAUSED",
-                TransportState::Stopped => "READY",
-            }
-        };
-        ui.label(egui::RichText::new(state).strong().size(18.0));
-
-        if let Some(target) = target {
-            let components = target
-                .notes
-                .iter()
-                .filter_map(|note| note.drum_component)
-                .map(|component| component.label())
-                .collect::<Vec<_>>()
-                .join(" + ");
-            ui.add_space(6.0);
-            ui.weak("CURRENT TARGET");
-            ui.label(egui::RichText::new(components).strong().size(34.0));
-            ui.label(
-                egui::RichText::new(if target.state == TargetState::Hittable {
-                    "NOW".to_string()
-                } else {
-                    format!("In {:.2} s", target.time_until_seconds.max(0.0))
-                })
-                .strong()
-                .size(24.0),
-            );
-            let approach = (1.0 - target.time_until_seconds.max(0.0) as f32 / 5.0).clamp(0.0, 1.0);
-            ui.add(
-                egui::ProgressBar::new(approach)
-                    .desired_width(ui.available_width().min(440.0))
-                    .text(if target.state == TargetState::Hittable {
-                        "HIT WINDOW"
-                    } else {
-                        "Target timing"
-                    }),
-            );
-            ui.label(if target.ordinal_start == target.ordinal_end {
-                format!(
-                    "Target {} / {}",
-                    target.ordinal_start, target.total_matchable
-                )
-            } else {
-                format!(
-                    "Targets {}-{} / {}",
-                    target.ordinal_start, target.ordinal_end, target.total_matchable
-                )
-            });
-            ui.add(
-                egui::ProgressBar::new(completed as f32 / total.max(1) as f32)
-                    .desired_width(ui.available_width().min(440.0)),
-            );
-
-            ui.add_space(8.0);
-            ui.columns(2, |columns| {
-                columns[0].weak("LAST RESULT");
-                if let Some(result) = &app.displayed_practice_result {
-                    show_last_result(&mut columns[0], result);
-                } else {
-                    columns[0].label("Waiting for input...");
-                }
-                columns[1].weak("NEXT");
-                if let Some(next) = session.next_target_after(
-                    *target.expected_indices.last().unwrap(),
-                    transport.current_tick(),
-                    transport,
-                ) {
-                    let components = next
-                        .notes
-                        .iter()
-                        .filter_map(|note| note.drum_component)
-                        .map(|component| component.label())
-                        .collect::<Vec<_>>()
-                        .join(" + ");
-                    columns[1].label(egui::RichText::new(components).strong().size(20.0));
-                    columns[1].label(format!("in {:.2} s", next.time_until_seconds.max(0.0)));
-                } else {
-                    columns[1].label("N/A");
-                }
-            });
-        } else if total > 0 && completed == total {
-            show_performance_summary(ui, &performance);
-        } else {
-            ui.label("No matchable drum targets in the selected track.");
-        }
-        if completed < total {
-            show_live_performance(ui, &performance);
-        }
-    }
-
-    ui.add_space(10.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(if app.connected {
-            format!(
-                "MIDI: {} (Connected)",
-                app.backend.connected_port_name().unwrap_or("Connected")
-            )
-        } else {
-            "MIDI: Disconnected".to_string()
-        });
-        ui.separator();
-        ui.label(format!(
-            "Metronome: {}",
-            if app.metronome_enabled { "ON" } else { "OFF" }
-        ));
-        ui.label(format!(
-            "Subdivision: {}",
-            app.metronome.subdivision().label()
-        ));
-    });
-    if let Some(hit) = &app.last_live_hit {
-        ui.label(format!(
-            "LAST INPUT: {}",
-            hit.drum_component
-                .map(|component| component.label())
-                .unwrap_or("Unmapped")
-        ));
-    }
-
-    ui.add_space(8.0);
-    ui.strong("TRANSPORT");
-    ui.horizontal(|ui| {
-        if ui.button("Play").clicked() {
-            if transport.state() == TransportState::Stopped && transport.current_tick() == 0 {
-                app.metronome.reset();
-                if let Some(session) = app.practice_session.as_mut() {
-                    session.reset();
-                }
-            } else {
-                app.metronome.sync_to_transport(transport);
-            }
-            transport.play();
-        }
-        if ui.button("Pause").clicked() {
-            transport.pause();
-            app.metronome.sync_to_transport(transport);
-        }
-        if ui.button("Stop").clicked() {
-            transport.stop();
-            app.metronome.reset();
-            if let Some(session) = app.practice_session.as_mut() {
-                session.on_stop();
-            }
-        }
-        if ui.button("Beginning").clicked() {
-            transport.seek(0);
-            app.metronome.sync_to_transport(transport);
-            if let Some(session) = app.practice_session.as_mut() {
-                session.on_seek_to_tick(transport.current_tick(), transport);
-            }
-        }
-        if ui.button("End").clicked() {
-            transport.seek_to_end();
-            app.metronome.sync_to_transport(transport);
-            if let Some(session) = app.practice_session.as_mut() {
-                session.on_seek_to_tick(transport.current_tick(), transport);
-            }
-        }
-    });
-    let mut requested_tick = transport.current_tick();
-    if ui
-        .add(egui::Slider::new(&mut requested_tick, 0..=transport.final_tick()).text("Seek tick"))
-        .changed()
-    {
-        transport.seek(requested_tick.min(i64::MAX as u64) as i64);
-        app.metronome.sync_to_transport(transport);
-        if let Some(session) = app.practice_session.as_mut() {
-            session.on_seek_to_tick(transport.current_tick(), transport);
-        }
-    }
-    let musical = transport.musical_position();
-    let (numerator, denominator) = transport
-        .position_map()
-        .time_signature_at_tick(transport.current_tick());
-    let ppq = transport.position_map().ticks_per_quarter();
-    ui.label(format!(
-        "{} / {} | Bar {} | Beat {}",
-        time_text(transport.elapsed_seconds()),
-        time_text(transport.total_seconds()),
-        musical.measure,
-        musical.beat
-    ));
-    ui.add_space(10.0);
-    ui.heading("TEMPO");
-    ui.label(format!(
-        "Original MIDI: {:.1} BPM{}",
-        transport.original_bpm(),
-        if transport.tempo_scale() != 1.0 {
-            " (preserved)"
-        } else {
-            ""
-        }
-    ));
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Practice:").size(18.0));
-        let decrement = ui
-            .add_sized(
-                [44.0, 36.0],
-                egui::Button::new(egui::RichText::new("-").size(24.0)),
-            )
-            .clicked();
-        ui.label(
-            egui::RichText::new(format!("{:.0} BPM", transport.practice_starting_bpm()))
-                .strong()
-                .size(26.0),
-        );
-        let increment = ui
-            .add_sized(
-                [44.0, 36.0],
-                egui::Button::new(egui::RichText::new("+").size(24.0)),
-            )
-            .clicked();
-        if decrement {
-            transport.set_practice_bpm(transport.practice_starting_bpm() - 1.0);
-        }
-        if increment {
-            transport.set_practice_bpm(transport.practice_starting_bpm() + 1.0);
-        }
-        if ui.button("Reset to MIDI tempo").clicked() {
-            transport.reset_practice_tempo();
-        }
-    });
-    if transport.tempo_scale() != 1.0 {
-        ui.weak(format!(
-            "Current effective tempo: {:.1} BPM (original current tempo: {:.1} BPM)",
-            transport.current_bpm(),
-            transport.original_bpm()
-        ));
-    }
-    egui::CollapsingHeader::new("Debug / Details").show(ui, |ui| {
-        ui.monospace(format!("State: {:?}", transport.state()));
-        ui.monospace(format!(
-            "Transport tick: {} / {}",
-            transport.current_tick(),
-            transport.final_tick()
-        ));
-        ui.monospace(format!(
-            "Time signature: {numerator}/{denominator} | PPQ: {}",
-            ppq.map(|value| value.to_string())
-                .unwrap_or_else(|| "SMPTE".to_string())
-        ));
-        ui.monospace(format!(
-            "Original BPM: {:.1} | Effective BPM: {:.1}",
-            transport.original_bpm(),
-            transport.current_bpm()
-        ));
-        if let Some(session) = &app.practice_session {
-            ui.monospace(format!(
-                "Pending: {} | Results: {} | Match window: +/-{} ms",
-                session.pending_count(),
-                session.results().len(),
-                session.matching_window().as_millis()
-            ));
-            if let Some(target) = session.current_target(transport.current_tick(), transport) {
-                ui.monospace(format!(
-                    "Expected indices: {:?} | tick {} | distance {:+.1} ms",
-                    target.expected_indices,
-                    target.tick,
-                    target.time_until_seconds * 1_000.0
-                ));
-            }
-            if let Some(result) = session.results().last() {
-                ui.monospace(format!(
-                    "Last raw result: {:?} | ticks {:?} | micros {:?}",
-                    result.kind, result.timing_difference_ticks, result.timing_difference_micros
-                ));
-            }
-        }
-        if let Some(hit) = &app.last_live_hit {
-            ui.monospace(format!(
-                "Last input: MIDI {} | channel {} | velocity {} | tick {}",
-                hit.received_midi_note,
-                hit.channel + 1,
-                hit.velocity,
-                hit.transport_tick
-            ));
-        }
-    });
-    ui.separator();
-}
-
 fn show_last_result(ui: &mut egui::Ui, result: &drums_core::PracticeResult) {
     let expected = result
         .expected
@@ -2208,34 +1889,6 @@ fn show_last_result(ui: &mut egui::Ui, result: &drums_core::PracticeResult) {
             ui.monospace(format!("{:+.1} ms", value as f64 / 1_000.0));
         }
     }
-}
-
-#[allow(dead_code)]
-fn show_live_performance(ui: &mut egui::Ui, performance: &PracticePerformance) {
-    ui.add_space(10.0);
-    ui.weak("SESSION");
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Accuracy: {:.1}%", performance.accuracy_percent()));
-        ui.label(format!(
-            "Hits: {} / {} finalized",
-            performance.correct_hits, performance.finalized_expected
-        ));
-        ui.colored_label(
-            RESULT_CORRECT,
-            format!("Correct: {}", performance.good_hits),
-        );
-        ui.colored_label(RESULT_EARLY, format!("Early: {}", performance.early_hits));
-        ui.colored_label(RESULT_LATE, format!("Late: {}", performance.late_hits));
-        ui.colored_label(
-            RESULT_WRONG_DRUM,
-            format!("Wrong Drum: {}", performance.wrong_drums),
-        );
-        ui.colored_label(RESULT_MISSED, format!("Missed: {}", performance.missed));
-        ui.colored_label(
-            RESULT_EXTRA,
-            format!("Extra: {}", performance.ignored_extra_hits),
-        );
-    });
 }
 
 fn show_performance_summary(ui: &mut egui::Ui, performance: &PracticePerformance) {
@@ -2323,82 +1976,6 @@ fn tendency_text(tendency: TimingTendency) -> String {
     }
 }
 
-#[allow(dead_code)]
-fn metronome_controls(app: &mut DrumApp, ui: &mut egui::Ui) {
-    let Some(transport) = app.transport.as_ref() else {
-        return;
-    };
-    ui.add_space(10.0);
-    ui.heading("METRONOME");
-    ui.separator();
-    ui.checkbox(&mut app.metronome_enabled, "Metronome on");
-    // `Metronome` has mutable state, so subdivision selection is applied via
-    // independent controls rather than replacing the generator.
-    ui.horizontal(|ui| {
-        let auto_clicked = ui.selectable_label(app.subdivision_auto, "Auto").clicked();
-        if auto_clicked {
-            app.subdivision_auto = true;
-            if let Some(suggestion) = app.subdivision_suggestion {
-                app.metronome.set_subdivision(suggestion.subdivision);
-                app.metronome.sync_to_transport(transport);
-            }
-        }
-        for subdivision in [
-            Subdivision::Quarter,
-            Subdivision::Eighth,
-            Subdivision::Sixteenth,
-        ] {
-            if ui
-                .selectable_label(
-                    !app.subdivision_auto && app.metronome.subdivision() == subdivision,
-                    subdivision.label(),
-                )
-                .clicked()
-            {
-                app.subdivision_auto = false;
-                app.metronome.set_subdivision(subdivision);
-                app.metronome.sync_to_transport(transport);
-            }
-        }
-        ui.weak(if app.click_audio.available() {
-            "Synthesized click output available"
-        } else {
-            "Audio output unavailable"
-        });
-    });
-    if let Some(suggestion) = app.subdivision_suggestion {
-        ui.label(format!(
-            "Suggested: {} notes | Confidence: {}",
-            suggestion.subdivision.label(),
-            suggestion.confidence.label()
-        ));
-        ui.weak("Auto analyzes MIDI tick positions only; it never moves or quantizes notes.");
-    }
-    let tokens = count_tokens(
-        transport.position_map(),
-        transport.current_tick(),
-        app.metronome.subdivision(),
-    );
-    ui.horizontal_wrapped(|ui| {
-        for token in tokens {
-            if token.active {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 190, 255),
-                    egui::RichText::new(token.label).strong().size(22.0),
-                );
-            } else {
-                ui.label(egui::RichText::new(token.label).size(20.0));
-            }
-        }
-    });
-    ui.weak(format!(
-        "Tempo: {:.1} BPM | {} subdivision",
-        transport.current_bpm(),
-        app.metronome.subdivision().label()
-    ));
-    ui.separator();
-}
-
 fn metadata(ui: &mut egui::Ui, file: &MidiFile) {
     ui.heading("MIDI FILE");
     ui.separator();
@@ -2465,36 +2042,6 @@ fn metadata(ui: &mut egui::Ui, file: &MidiFile) {
         });
 }
 
-fn midi_event_table(ui: &mut egui::Ui, expected: &[ExpectedNote]) {
-    egui::Grid::new("library_midi_events")
-        .striped(true)
-        .num_columns(5)
-        .spacing([16.0, 4.0])
-        .show(ui, |ui| {
-            ui.strong("Time");
-            ui.strong("Tick");
-            ui.strong("MIDI");
-            ui.strong("Component");
-            ui.strong("Velocity");
-            ui.end_row();
-            for event in expected.iter().take(1_000) {
-                ui.monospace(format!("{:.3}s", event.timestamp_seconds));
-                ui.monospace(event.tick.to_string());
-                ui.monospace(event.midi_note.to_string());
-                ui.monospace(
-                    event
-                        .drum_component
-                        .map(|value| value.label())
-                        .unwrap_or("Unknown"),
-                );
-                ui.monospace(event.velocity.to_string());
-                ui.end_row();
-            }
-        });
-    if expected.len() > 1_000 {
-        ui.weak(format!("Showing 1,000 of {} events.", expected.len()));
-    }
-}
 fn timing_text(timing: MidiTiming) -> String {
     match timing {
         MidiTiming::TicksPerQuarter(ticks) => format!("{ticks} ticks per quarter note"),
@@ -2512,9 +2059,61 @@ fn duration_text(seconds: f64) -> String {
     )
 }
 
+fn time_text(seconds: f64) -> String {
+    format!(
+        "{:02}:{:05.2}",
+        (seconds / 60.0).floor() as u64,
+        seconds % 60.0
+    )
+}
+
 #[cfg(test)]
 mod phase5_visual_tests {
     use super::*;
+
+    fn expected_note(component: Option<DrumComponent>, tick: u64) -> ExpectedNote {
+        ExpectedNote {
+            tick,
+            timestamp_seconds: tick as f64 / 960.0,
+            midi_note: 36,
+            velocity: 100,
+            channel: 9,
+            track: 0,
+            drum_component: component,
+            target_component: component,
+        }
+    }
+
+    fn actual_hit(component: Option<DrumComponent>, tick: u64) -> drums_core::ActualHit {
+        drums_core::ActualHit {
+            received_midi_note: 38,
+            drum_component: component,
+            velocity: 100,
+            channel: 9,
+            input_timestamp_micros: 1,
+            elapsed_seconds: tick as f64 / 960.0,
+            transport_tick: tick,
+        }
+    }
+
+    fn test_transport() -> MusicalTransport {
+        use drums_core::midi::{TempoEvent, TimeSignatureEvent};
+        MusicalTransport::new(
+            MidiTiming::TicksPerQuarter(480),
+            &[TempoEvent {
+                tick: 0,
+                micros_per_quarter: 500_000,
+            }],
+            &[TimeSignatureEvent {
+                tick: 0,
+                numerator: 4,
+                denominator_exponent: 2,
+                clocks_per_click: 24,
+                thirty_seconds_per_quarter: 8,
+            }],
+            10_000,
+        )
+    }
 
     fn result(kind: PracticeResultKind, judgment: Option<TimingJudgment>) -> PracticeResult {
         PracticeResult {
@@ -2576,10 +2175,220 @@ mod phase5_visual_tests {
 
     #[test]
     fn every_component_and_unknown_have_stable_lanes() {
+        let expected = ExpectedTimelineDrums::default();
+        let lanes = timeline_lanes(false, &expected, &[]);
         for (index, component) in DrumComponent::ALL.into_iter().enumerate() {
-            assert_eq!(lane_index(Some(component), false), index);
+            assert_eq!(lane_index(&lanes, Some(component)), Some(index));
         }
-        assert_eq!(lane_index(None, true), DrumComponent::ALL.len());
+        assert_eq!(lane_index(&lanes, None), None);
+
+        let all_expected_notes = DrumComponent::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, component)| expected_note(Some(component), index as u64 * 120))
+            .collect::<Vec<_>>();
+        let all_expected = ExpectedTimelineDrums::from_expected(&all_expected_notes);
+        assert_eq!(timeline_lanes(true, &all_expected, &[]), lanes);
+    }
+
+    #[test]
+    fn expected_drums_filter_is_dynamic_and_off_preserves_all_actual_hits() {
+        let expected = ExpectedTimelineDrums::from_expected(&[
+            expected_note(Some(DrumComponent::HiHat), 0),
+            expected_note(Some(DrumComponent::Kick), 0),
+        ]);
+        assert!(timeline_actual_hit_visible(
+            false,
+            &expected,
+            Some(DrumComponent::LowTom)
+        ));
+        assert!(timeline_actual_hit_visible(
+            true,
+            &expected,
+            Some(DrumComponent::HiHat)
+        ));
+        assert!(timeline_actual_hit_visible(
+            true,
+            &expected,
+            Some(DrumComponent::Kick)
+        ));
+        assert!(!timeline_actual_hit_visible(
+            true,
+            &expected,
+            Some(DrumComponent::LowTom)
+        ));
+
+        let filtered_lanes = timeline_lanes(true, &expected, &[]);
+        assert_eq!(
+            filtered_lanes,
+            vec![Some(DrumComponent::HiHat), Some(DrumComponent::Kick)]
+        );
+    }
+
+    #[test]
+    fn expected_filter_keeps_unknown_only_when_the_lesson_expects_it() {
+        let known =
+            ExpectedTimelineDrums::from_expected(&[expected_note(Some(DrumComponent::Snare), 0)]);
+        assert!(!timeline_actual_hit_visible(true, &known, None));
+
+        let unknown = ExpectedTimelineDrums::from_expected(&[expected_note(None, 0)]);
+        assert!(timeline_actual_hit_visible(true, &unknown, None));
+        assert_eq!(timeline_lanes(true, &unknown, &[]), vec![None]);
+
+        let empty = ExpectedTimelineDrums::default();
+        assert!(timeline_lanes(true, &empty, &[]).is_empty());
+        assert!(!timeline_actual_hit_visible(
+            true,
+            &empty,
+            Some(DrumComponent::Kick)
+        ));
+    }
+
+    #[test]
+    fn hi_hat_states_remain_distinct_expected_roles() {
+        let expected = ExpectedTimelineDrums::from_expected(&[
+            expected_note(Some(DrumComponent::HiHat), 0),
+            expected_note(Some(DrumComponent::HiHatOpen), 120),
+            expected_note(Some(DrumComponent::HiHatPedal), 240),
+        ]);
+        assert_eq!(
+            timeline_lanes(true, &expected, &[]),
+            vec![
+                Some(DrumComponent::HiHat),
+                Some(DrumComponent::HiHatOpen),
+                Some(DrumComponent::HiHatPedal),
+            ]
+        );
+    }
+
+    #[test]
+    fn expected_filter_cache_replaces_track_roles_and_survives_view_window_changes() {
+        let first =
+            ExpectedTimelineDrums::from_expected(&[expected_note(Some(DrumComponent::Kick), 0)]);
+        let second = ExpectedTimelineDrums::from_expected(&[
+            expected_note(Some(DrumComponent::Crash), 0),
+            expected_note(Some(DrumComponent::Ride), 480),
+        ]);
+        assert_ne!(first, second);
+        assert_eq!(
+            timeline_lanes(true, &second, &[]),
+            vec![Some(DrumComponent::Crash), Some(DrumComponent::Ride)]
+        );
+
+        let unchanged = second.clone();
+        let _ = visible_time_window(12.0, 120.0, 1.5, 8.0);
+        let _ = timeline_x(13.0, 12.0, 1.5, 8.0, 100.0, 250.0, 900.0);
+        assert_eq!(second, unchanged);
+    }
+
+    #[test]
+    fn hiding_unrelated_hits_does_not_change_wrong_extra_or_accuracy_results() {
+        let transport = test_transport();
+        let note = expected_note(Some(DrumComponent::Kick), 960);
+        let expected = ExpectedTimelineDrums::from_expected(std::slice::from_ref(&note));
+        let mut session =
+            drums_core::PracticeSession::new(vec![note], drums_core::MatchingConfig::default());
+        session.record_hit(actual_hit(Some(DrumComponent::Snare), 960), &transport);
+        session.record_hit(actual_hit(Some(DrumComponent::LowTom), 3_000), &transport);
+
+        let before_filter = PracticePerformance::from_session(&session);
+        let visible_actuals = session
+            .results()
+            .iter()
+            .filter_map(|result| result.actual.as_ref())
+            .filter(|actual| timeline_actual_hit_visible(true, &expected, actual.drum_component))
+            .count();
+        let after_filter = PracticePerformance::from_session(&session);
+
+        assert_eq!(visible_actuals, 0);
+        assert_eq!(before_filter, after_filter);
+        assert_eq!(after_filter.wrong_drums, 1);
+        assert_eq!(after_filter.ignored_extra_hits, 1);
+        assert_eq!(after_filter.accuracy_percent(), 0.0);
+    }
+
+    #[test]
+    fn adaptive_header_keeps_beats_ahead_of_colliding_subdivisions() {
+        let labels = vec![
+            HeaderLabelCandidate {
+                x: 20.0,
+                width: 9.0,
+                priority: HeaderLabelPriority::Subdivision,
+                text: "&".into(),
+            },
+            HeaderLabelCandidate {
+                x: 24.0,
+                width: 9.0,
+                priority: HeaderLabelPriority::Beat,
+                text: "2".into(),
+            },
+            HeaderLabelCandidate {
+                x: 60.0,
+                width: 9.0,
+                priority: HeaderLabelPriority::Subdivision,
+                text: "&".into(),
+            },
+        ];
+        let selected = select_header_labels(&labels, 0.0, 100.0, 5.0);
+        assert!(!selected.contains(&0));
+        assert!(selected.contains(&1));
+        assert!(selected.contains(&2));
+    }
+
+    #[test]
+    fn adaptive_header_drops_crowded_long_bar_labels_without_moving_boundaries() {
+        let labels = vec![
+            HeaderLabelCandidate {
+                x: 10.0,
+                width: 48.0,
+                priority: HeaderLabelPriority::Bar,
+                text: "Bar 999".into(),
+            },
+            HeaderLabelCandidate {
+                x: 45.0,
+                width: 55.0,
+                priority: HeaderLabelPriority::Bar,
+                text: "Bar 1000".into(),
+            },
+            HeaderLabelCandidate {
+                x: 110.0,
+                width: 55.0,
+                priority: HeaderLabelPriority::Bar,
+                text: "Bar 1001".into(),
+            },
+        ];
+        let selected = select_header_labels(&labels, 0.0, 180.0, 5.0);
+        assert_eq!(selected, vec![0, 2]);
+        assert_eq!(labels[0].x, 10.0);
+        assert_eq!(labels[2].x, 110.0);
+    }
+
+    #[test]
+    fn header_labels_never_overlap_or_escape_chart_bounds() {
+        let labels = (0..20)
+            .map(|index| HeaderLabelCandidate {
+                x: index as f32 * 8.0,
+                width: 12.0,
+                priority: if index % 4 == 0 {
+                    HeaderLabelPriority::Beat
+                } else {
+                    HeaderLabelPriority::Subdivision
+                },
+                text: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let selected = select_header_labels(&labels, 10.0, 120.0, 5.0);
+        let mut previous_end = None;
+        for index in selected {
+            let start = labels[index].x + 3.0;
+            let end = start + labels[index].width;
+            assert!(start >= 10.0);
+            assert!(end <= 120.0);
+            if let Some(previous_end) = previous_end {
+                assert!(start >= previous_end + 5.0);
+            }
+            previous_end = Some(end);
+        }
     }
 
     #[test]
@@ -2645,28 +2454,13 @@ mod phase5_visual_tests {
         };
         let mut missed = result(PracticeResultKind::Missed, None);
         missed.expected = Some(note.clone());
+        let expected = ExpectedTimelineDrums::from_expected(std::slice::from_ref(&note));
+        let lanes = timeline_lanes(true, &expected, &[]);
+        assert_eq!(lane_index(&lanes, note.drum_component), Some(0));
         assert!(expected_is_missed(&note, &[missed]));
         assert!(!expected_is_missed(
             &note,
             &[result(PracticeResultKind::Ignored, None)]
         ));
-    }
-}
-fn time_text(seconds: f64) -> String {
-    format!(
-        "{:02}:{:05.2}",
-        (seconds / 60.0).floor() as u64,
-        seconds % 60.0
-    )
-}
-fn channels(channels: &[u8]) -> String {
-    if channels.is_empty() {
-        "none".to_string()
-    } else {
-        channels
-            .iter()
-            .map(|channel| (channel + 1).to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }

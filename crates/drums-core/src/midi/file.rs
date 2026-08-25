@@ -179,7 +179,7 @@ impl MidiFile {
         let timing = match smf.header.timing {
             Timing::Metrical(ticks) => MidiTiming::TicksPerQuarter(ticks.as_int()),
             Timing::Timecode(fps, ticks) => MidiTiming::Timecode {
-                frames_per_second: fps.as_int() as u8,
+                frames_per_second: fps.as_int(),
                 ticks_per_frame: ticks,
             },
         };

@@ -100,7 +100,7 @@ fn primary(ui: &mut egui::Ui, s: &CompletedPracticeSession) {
     let st = &s.statistics;
     let total = st.correct_count + st.missed_count + st.wrong_drum_count;
     egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(20, 29, 39))
+        .fill(ui.visuals().faint_bg_color)
         .inner_margin(9.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

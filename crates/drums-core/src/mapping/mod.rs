@@ -104,6 +104,19 @@ impl DrumComponent {
         }
     }
 
+    /// Default metadata stored when this component is learned by Setup or the
+    /// manual mapping UI. Non-hi-hat zones remain unnamed until explicitly
+    /// identified by a future device profile.
+    pub fn default_articulation(self) -> Option<MappingArticulation> {
+        match self {
+            DrumComponent::HiHat => Some(MappingArticulation::Closed),
+            DrumComponent::HiHatOpen => Some(MappingArticulation::Open),
+            DrumComponent::HiHatPedal => Some(MappingArticulation::Pedal),
+            DrumComponent::HiHatPedalPosition => Some(MappingArticulation::Continuous),
+            _ => None,
+        }
+    }
+
     /// Title-case name used when persisting the component (e.g. `"Low Tom"`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -120,22 +133,25 @@ impl DrumComponent {
             DrumComponent::LowTom => "Low Tom",
         }
     }
+}
 
-    /// Resolves a component from its persisted [`Self::as_str`] form.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "Crash" => Some(DrumComponent::Crash),
-            "Ride" => Some(DrumComponent::Ride),
-            "Hi-Hat" => Some(DrumComponent::HiHat),
-            "Hi-Hat Open" => Some(DrumComponent::HiHatOpen),
-            "Hi-Hat Pedal" => Some(DrumComponent::HiHatPedal),
-            "Hi-Hat Pedal Position" => Some(DrumComponent::HiHatPedalPosition),
-            "Snare" => Some(DrumComponent::Snare),
-            "Kick" => Some(DrumComponent::Kick),
-            "Hi Tom" => Some(DrumComponent::HiTom),
-            "Mid Tom" => Some(DrumComponent::MidTom),
-            "Low Tom" => Some(DrumComponent::LowTom),
-            _ => None,
+impl std::str::FromStr for DrumComponent {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "Crash" => Ok(Self::Crash),
+            "Ride" => Ok(Self::Ride),
+            "Hi-Hat" => Ok(Self::HiHat),
+            "Hi-Hat Open" => Ok(Self::HiHatOpen),
+            "Hi-Hat Pedal" => Ok(Self::HiHatPedal),
+            "Hi-Hat Pedal Position" => Ok(Self::HiHatPedalPosition),
+            "Snare" => Ok(Self::Snare),
+            "Kick" => Ok(Self::Kick),
+            "Hi Tom" => Ok(Self::HiTom),
+            "Mid Tom" => Ok(Self::MidTom),
+            "Low Tom" => Ok(Self::LowTom),
+            _ => Err(format!("unknown drum component {value:?}")),
         }
     }
 }
@@ -155,8 +171,7 @@ impl Serialize for DrumComponent {
 impl<'de> Deserialize<'de> for DrumComponent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        DrumComponent::from_str(&s)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown drum component {s:?}")))
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -227,6 +242,18 @@ impl CcRange {
         self.min = self.min.min(value);
         self.max = self.max.max(value);
     }
+
+    /// Clamps a controller value to the calibrated range and maps it to
+    /// `0.0..=1.0`, where zero is the calibrated minimum and one is the
+    /// calibrated maximum.
+    pub fn normalize(self, value: u8) -> f64 {
+        let span = self.max.saturating_sub(self.min);
+        if span == 0 {
+            return 0.0;
+        }
+        let clamped = value.clamp(self.min, self.max);
+        f64::from(clamped - self.min) / f64::from(span)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +279,52 @@ pub struct MappingInputIdentity {
     pub event_kind: MappingEventKind,
     pub number: u8,
     pub channel: u8,
+}
+
+/// A mapping-relevant MIDI input plus its transient velocity/controller value.
+///
+/// This is the single filtering boundary shared by Setup, Drum Mapping, the
+/// live monitor interpretation, and practice resolution. Note Off and
+/// zero-velocity Note On messages never cross this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedMidiInput {
+    pub event_kind: MappingEventKind,
+    pub number: u8,
+    pub channel: u8,
+    pub value: u8,
+}
+
+impl ObservedMidiInput {
+    pub fn from_event(event: &crate::midi::MidiEvent) -> Option<Self> {
+        let channel = event.message.channel_number()?;
+        let (event_kind, number, value) = match event.message.kind {
+            crate::midi::MessageKind::NoteOn if event.message.velocity().unwrap_or(0) > 0 => (
+                MappingEventKind::Note,
+                event.message.note()?,
+                event.message.velocity()?,
+            ),
+            crate::midi::MessageKind::ControlChange => (
+                MappingEventKind::ControlChange,
+                event.message.data1?,
+                event.message.data2.unwrap_or(0),
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            event_kind,
+            number,
+            channel,
+            value,
+        })
+    }
+
+    pub fn identity(self) -> MappingInputIdentity {
+        MappingInputIdentity {
+            event_kind: self.event_kind,
+            number: self.number,
+            channel: self.channel,
+        }
+    }
 }
 
 impl DrumMapping {
@@ -361,12 +434,25 @@ impl DrumKitConfiguration {
         self.mappings.push(mapping);
     }
 
-    /// Resolves a physical input to the logical identity consumed by scoring.
-    pub fn resolve(&self, identity: MappingInputIdentity) -> Option<DrumComponent> {
+    /// Returns the configured mapping that owns a physical MIDI input.
+    pub fn mapping_for_input(&self, identity: MappingInputIdentity) -> Option<&DrumMapping> {
         self.mappings
             .iter()
             .find(|mapping| mapping.matches(identity))
+    }
+
+    /// Resolves a physical input to the logical identity consumed by scoring.
+    pub fn resolve(&self, identity: MappingInputIdentity) -> Option<DrumComponent> {
+        self.mapping_for_input(identity)
             .map(|mapping| mapping.component)
+    }
+
+    /// Resolves a raw MIDI event through the shared mapping-input filter.
+    pub fn resolve_drum_from_midi_event(
+        &self,
+        event: &crate::midi::MidiEvent,
+    ) -> Option<DrumComponent> {
+        self.resolve(ObservedMidiInput::from_event(event)?.identity())
     }
 
     /// Number of logical drums represented, independent of alias count.
@@ -467,10 +553,7 @@ mod phase5e_tests {
         let encoded = toml::to_string(&config).unwrap();
         let decoded: DrumKitConfiguration = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, config);
-        assert_eq!(
-            DrumComponent::from_str("Hi-Hat"),
-            Some(DrumComponent::HiHat)
-        );
+        assert_eq!("Hi-Hat".parse::<DrumComponent>(), Ok(DrumComponent::HiHat));
     }
 
     #[test]
@@ -552,5 +635,46 @@ channel = 10
         let decoded: DrumKitConfiguration = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, config);
         assert!(!decoded.is_usable());
+    }
+
+    #[test]
+    fn cc_range_normalization_clamps_below_and_above_calibration() {
+        let range = CcRange::new(20, 120);
+        assert_eq!(range.normalize(0), 0.0);
+        assert_eq!(range.normalize(20), 0.0);
+        assert_eq!(range.normalize(70), 0.5);
+        assert_eq!(range.normalize(120), 1.0);
+        assert_eq!(range.normalize(127), 1.0);
+        assert_eq!(CcRange::new(64, 64).normalize(100), 0.0);
+    }
+
+    #[test]
+    fn shared_midi_input_filter_handles_notes_cc_and_non_hits() {
+        use crate::midi::{MessageKind, MidiEvent, MidiMessage};
+
+        let event = |kind, data1, data2| MidiEvent {
+            message: MidiMessage {
+                kind,
+                channel: Some(9),
+                data1: Some(data1),
+                data2: Some(data2),
+                system_exclusive: None,
+            },
+            timestamp_micros: 1,
+        };
+        let note = ObservedMidiInput::from_event(&event(MessageKind::NoteOn, 53, 91)).unwrap();
+        assert_eq!(note.event_kind, MappingEventKind::Note);
+        assert_eq!(note.number, 53);
+        assert_eq!(note.channel, 10);
+        assert_eq!(note.value, 91);
+
+        let cc =
+            ObservedMidiInput::from_event(&event(MessageKind::ControlChange, 17, 104)).unwrap();
+        assert_eq!(cc.event_kind, MappingEventKind::ControlChange);
+        assert_eq!(cc.number, 17);
+        assert_eq!(cc.value, 104);
+
+        assert!(ObservedMidiInput::from_event(&event(MessageKind::NoteOn, 53, 0)).is_none());
+        assert!(ObservedMidiInput::from_event(&event(MessageKind::NoteOff, 53, 64)).is_none());
     }
 }

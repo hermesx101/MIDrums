@@ -106,8 +106,7 @@ impl TempoMap {
         let micros = self
             .events
             .iter()
-            .filter(|event| event.tick <= tick)
-            .last()
+            .rfind(|event| event.tick <= tick)
             .map(|event| event.micros_per_quarter)
             .unwrap_or(DEFAULT_MICROS_PER_QUARTER);
         60_000_000.0 / micros as f64
@@ -170,8 +169,7 @@ impl MusicalPositionMap {
     pub fn beats_per_measure_at_tick(&self, tick: u64) -> u8 {
         self.signatures
             .iter()
-            .filter(|signature| signature.tick <= tick)
-            .last()
+            .rfind(|signature| signature.tick <= tick)
             .map(|signature| signature.numerator)
             .unwrap_or(4)
     }
@@ -186,8 +184,7 @@ impl MusicalPositionMap {
     pub fn time_signature_at_tick(&self, tick: u64) -> (u8, u32) {
         self.signatures
             .iter()
-            .filter(|signature| signature.tick <= tick)
-            .last()
+            .rfind(|signature| signature.tick <= tick)
             .map(|signature| (signature.numerator, signature.denominator()))
             .unwrap_or((4, 4))
     }

@@ -1,10 +1,8 @@
-//! DRUMS core library.
+//! Hardware-independent domain logic for MI Drums.
 //!
-//! Hardware-independent logic for the MIDI drum practice application. In
-//! Phase 1 this crate contains only the MIDI foundation: a streaming parser,
-//! event model and a thread-safe input backend. It deliberately has no GUI
-//! or audio dependencies so it can be unit-tested quickly and reused by any
-//! front-end.
+//! MIDI input/parsing, drum mapping, transport, scoring, notation, session
+//! history, performance, and progress live here. The crate deliberately has no
+//! GUI dependency, keeping behavior testable and reusable by the desktop app.
 
 pub mod audio_sync;
 pub mod mapping;
@@ -19,8 +17,8 @@ pub mod time;
 pub use audio_sync::{audio_position, compensate_midi_input, looped_audio_position};
 pub use mapping::{
     CcRange, DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingArticulation,
-    MappingConflict, MappingEventKind, MappingInputIdentity, MappingStore, SetupWizard,
-    SetupWizardState, SUPPORTED_COMPONENTS,
+    MappingConflict, MappingEventKind, MappingInputIdentity, MappingStore, ObservedMidiInput,
+    SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
 };
 pub use midi::{
     count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote,
@@ -37,8 +35,8 @@ pub use performance::{
     ComponentPerformance, PerformanceConfig, PracticePerformance, TimingTendency,
 };
 pub use practice::{
-    ActualHit, MatchingConfig, PracticeResult, PracticeResultKind, PracticeSession, PracticeTarget,
-    TargetState, TimingConfig, TimingJudgment,
+    ActualHit, HiHatPedalState, MatchingConfig, PracticeResult, PracticeResultKind,
+    PracticeSession, PracticeTarget, TargetState, TimingConfig, TimingJudgment,
 };
 pub use progress::{DrumProgressPoint, SessionProgressPoint, TrackProgress, WeakestDrum};
 pub use session_history::{

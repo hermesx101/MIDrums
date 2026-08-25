@@ -53,7 +53,7 @@ pub fn now_seconds() -> u64 {
         .as_secs()
 }
 
-fn storage_path() -> PathBuf {
+pub(crate) fn storage_path() -> PathBuf {
     if let Ok(value) = std::env::var("APPDATA") {
         return PathBuf::from(value)
             .join("drums")

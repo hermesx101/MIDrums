@@ -332,8 +332,8 @@ impl PracticeSessionStore {
         PathBuf::from("practice-sessions.toml")
     }
 
-    pub fn default() -> Self {
-        Self::new(Self::default_path())
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn append(&self, session: CompletedPracticeSession) -> io::Result<()> {
@@ -396,6 +396,12 @@ impl PracticeSessionStore {
         let text = toml::to_string_pretty(file)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(&self.path, text)
+    }
+}
+
+impl Default for PracticeSessionStore {
+    fn default() -> Self {
+        Self::new(Self::default_path())
     }
 }
 

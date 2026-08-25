@@ -62,11 +62,6 @@ impl MappingStore {
         PathBuf::from(".").join("drums-mappings")
     }
 
-    /// Creates the default user store (per [`Self::default_dir`]).
-    pub fn default() -> Self {
-        Self::new(Self::default_dir())
-    }
-
     /// The directory this store writes to.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -142,6 +137,12 @@ impl MappingStore {
         }
         fs::remove_file(&path)?;
         Ok(true)
+    }
+}
+
+impl Default for MappingStore {
+    fn default() -> Self {
+        Self::new(Self::default_dir())
     }
 }
 

@@ -1,21 +1,12 @@
 //! Transactional manual reassignment for Note and CC MIDI identities.
 
 use drums_core::mapping::{
-    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingArticulation,
-    MappingEventKind,
+    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingEventKind, ObservedMidiInput,
 };
-use drums_core::{MessageKind, MidiEvent};
+use drums_core::MidiEvent;
 use eframe::egui;
 
 use crate::{DrumApp, View};
-
-#[derive(Clone, Copy)]
-struct InputIdentity {
-    kind: MappingEventKind,
-    number: u8,
-    channel: u8,
-    value: u8,
-}
 
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.heading("DRUM MAPPING");
@@ -37,12 +28,12 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let latest = app.mapping_last_input.clone();
     app.mapping_last_detected_component = latest
         .as_ref()
-        .and_then(input_identity)
-        .and_then(|identity| mapped_component(&draft, identity));
+        .and_then(ObservedMidiInput::from_event)
+        .and_then(|input| draft.resolve(input.identity()));
     if app.mapping_reassign_component.is_some() && app.mapping_reassign_candidate.is_none() {
         if let Some(event) = latest.as_ref().filter(|event| {
             event.timestamp_micros > app.mapping_reassign_after_micros
-                && input_identity(event).is_some()
+                && ObservedMidiInput::from_event(event).is_some()
         }) {
             app.mapping_reassign_candidate = Some(event.clone());
         }
@@ -217,8 +208,8 @@ fn mapping_component_row(
                         for mapping in &aliases {
                             let text = mapping_text(mapping);
                             egui::Frame::default()
-                                .fill(egui::Color32::from_rgb(38, 42, 48))
-                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(62)))
+                                .fill(ui.visuals().faint_bg_color)
+                                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
                                 .corner_radius(3.0)
                                 .inner_margin(egui::Margin::symmetric(7, 3))
                                 .show(ui, |ui| {
@@ -282,12 +273,15 @@ fn reassignment_panel(
     draft: &mut DrumKitConfiguration,
     component: DrumComponent,
 ) {
-    egui::Frame::group(ui.style()).fill(egui::Color32::from_rgb(28, 48, 64)).inner_margin(14.0).show(ui, |ui| {
+    egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).stroke(egui::Stroke::new(1.0_f32, app.accent_color())).inner_margin(14.0).show(ui, |ui| {
         ui.heading("REASSIGNING");
         ui.strong(component.label());
         ui.label(reassignment_instruction(component));
-        let candidate = app.mapping_reassign_candidate.as_ref().and_then(input_identity);
-        let Some(identity) = candidate else {
+        let candidate = app
+            .mapping_reassign_candidate
+            .as_ref()
+            .and_then(ObservedMidiInput::from_event);
+        let Some(input) = candidate else {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
             ui.spinner();
@@ -297,16 +291,16 @@ fn reassignment_panel(
             return;
         };
         ui.colored_label(egui::Color32::from_rgb(90, 220, 140), "MIDI INPUT DETECTED");
-        ui.monospace(identity_text(identity));
-        if identity.kind == MappingEventKind::ControlChange {
+        ui.monospace(input_text(input));
+        if input.event_kind == MappingEventKind::ControlChange {
             let range = observed_cc_range(
                 &app.events,
-                identity,
+                input,
                 app.mapping_reassign_after_micros,
             );
             ui.add(
-                egui::ProgressBar::new(identity.value as f32 / 127.0)
-                    .text(format!("Pedal position: {} / 127", identity.value)),
+                egui::ProgressBar::new(input.value as f32 / 127.0)
+                    .text(format!("Pedal position: {} / 127", input.value)),
             );
             ui.monospace(format!(
                 "Observed controller range: {}–{}",
@@ -316,7 +310,7 @@ fn reassignment_panel(
         }
 
         let expects_cc = component == DrumComponent::HiHatPedalPosition;
-        if expects_cc && identity.kind == MappingEventKind::Note {
+        if expects_cc && input.event_kind == MappingEventKind::Note {
             ui.colored_label(egui::Color32::from_rgb(240, 190, 80), "A MIDI Note was detected. This may be a foot-hit event.");
             ui.horizontal(|ui| {
                 if ui.button("Assign as Foot Hit").clicked() { app.mapping_reassign_component = Some(DrumComponent::HiHatPedal); }
@@ -324,7 +318,7 @@ fn reassignment_panel(
             });
             return;
         }
-        if !expects_cc && identity.kind == MappingEventKind::ControlChange {
+        if !expects_cc && input.event_kind == MappingEventKind::ControlChange {
             ui.colored_label(egui::Color32::from_rgb(240, 190, 80), "Controller data is not a playable strike. Assign it as Pedal Position instead.");
             ui.horizontal(|ui| {
                 if ui.button("Use as Pedal Position").clicked() { app.mapping_reassign_component = Some(DrumComponent::HiHatPedalPosition); }
@@ -335,26 +329,24 @@ fn reassignment_panel(
 
         let conflict = draft.mappings.iter().find(|mapping| {
             mapping.component != component
-                && mapping.event_kind == identity.kind
-                && mapping.midi_note == identity.number
-                && mapping.channel == identity.channel
+                && mapping.matches(input.identity())
         }).copied();
-        let cc_range = (identity.kind == MappingEventKind::ControlChange).then(|| {
+        let cc_range = (input.event_kind == MappingEventKind::ControlChange).then(|| {
             observed_cc_range(
                 &app.events,
-                identity,
+                input,
                 app.mapping_reassign_after_micros,
             )
         });
         let new_mapping = DrumMapping {
             component,
-            event_kind: identity.kind,
-            midi_note: identity.number,
-            channel: identity.channel,
-            articulation: articulation_for(component),
+            event_kind: input.event_kind,
+            midi_note: input.number,
+            channel: input.channel,
+            articulation: component.default_articulation(),
             cc_range,
         };
-        let calibration_ready = identity.kind == MappingEventKind::Note
+        let calibration_ready = input.event_kind == MappingEventKind::Note
             || cc_range.is_some_and(|range| range.min < range.max);
         if !calibration_ready {
             ui.colored_label(
@@ -403,14 +395,10 @@ fn unknown_assignment_panel(
     draft: &DrumKitConfiguration,
     event: &MidiEvent,
 ) {
-    let Some(identity) = input_identity(event) else {
+    let Some(input) = ObservedMidiInput::from_event(event) else {
         return;
     };
-    let known = draft.mappings.iter().any(|mapping| {
-        mapping.event_kind == identity.kind
-            && mapping.midi_note == identity.number
-            && mapping.channel == identity.channel
-    });
+    let known = draft.resolve(input.identity()).is_some();
     if known {
         return;
     }
@@ -418,14 +406,14 @@ fn unknown_assignment_panel(
         .inner_margin(10.0)
         .show(ui, |ui| {
             ui.strong("UNKNOWN MIDI INPUT");
-            ui.monospace(identity_text(identity));
-            if identity.kind == MappingEventKind::ControlChange {
+            ui.monospace(input_text(input));
+            if input.event_kind == MappingEventKind::ControlChange {
                 ui.add(
-                    egui::ProgressBar::new(identity.value as f32 / 127.0)
-                        .text(format!("Pedal position: {} / 127", identity.value)),
+                    egui::ProgressBar::new(input.value as f32 / 127.0)
+                        .text(format!("Pedal position: {} / 127", input.value)),
                 );
             }
-            if identity.kind == MappingEventKind::ControlChange {
+            if input.event_kind == MappingEventKind::ControlChange {
                 ui.label("Compatible assignment: Hi-Hat Pedal Position");
                 if ui.button("Assign").clicked() {
                     begin_reassignment_with_event(
@@ -458,63 +446,20 @@ fn begin_reassignment_with_event(app: &mut DrumApp, component: DrumComponent, ev
     app.mapping_reassign_candidate = Some(event);
 }
 
-fn observed_cc_range(events: &[MidiEvent], identity: InputIdentity, after_micros: u64) -> CcRange {
-    let mut range = CcRange::new(identity.value, identity.value);
+fn observed_cc_range(events: &[MidiEvent], input: ObservedMidiInput, after_micros: u64) -> CcRange {
+    let mut range = CcRange::new(input.value, input.value);
     for event in events {
-        let Some(value) = input_identity(event) else {
+        let Some(observed) = ObservedMidiInput::from_event(event) else {
             continue;
         };
         if event.timestamp_micros > after_micros
-            && value.kind == MappingEventKind::ControlChange
-            && value.kind == identity.kind
-            && value.number == identity.number
-            && value.channel == identity.channel
+            && observed.event_kind == MappingEventKind::ControlChange
+            && observed.identity() == input.identity()
         {
-            range.observe(value.value);
+            range.observe(observed.value);
         }
     }
     range
-}
-
-fn articulation_for(component: DrumComponent) -> Option<MappingArticulation> {
-    match component {
-        DrumComponent::HiHat => Some(MappingArticulation::Closed),
-        DrumComponent::HiHatOpen => Some(MappingArticulation::Open),
-        DrumComponent::HiHatPedal => Some(MappingArticulation::Pedal),
-        DrumComponent::HiHatPedalPosition => Some(MappingArticulation::Continuous),
-        _ => None,
-    }
-}
-
-fn input_identity(event: &MidiEvent) -> Option<InputIdentity> {
-    let channel = event.message.channel_number()?;
-    match event.message.kind {
-        MessageKind::NoteOn if event.message.velocity().unwrap_or(0) > 0 => Some(InputIdentity {
-            kind: MappingEventKind::Note,
-            number: event.message.note()?,
-            channel,
-            value: event.message.velocity().unwrap_or(0),
-        }),
-        MessageKind::ControlChange => Some(InputIdentity {
-            kind: MappingEventKind::ControlChange,
-            number: event.message.data1?,
-            channel,
-            value: event.message.data2.unwrap_or(0),
-        }),
-        _ => None,
-    }
-}
-
-fn mapped_component(
-    config: &DrumKitConfiguration,
-    identity: InputIdentity,
-) -> Option<DrumComponent> {
-    config.mappings.iter().find_map(|mapping| {
-        (mapping.event_kind == identity.kind
-            && mapping.midi_note == identity.number
-            && mapping.channel == identity.channel)
-            .then_some(mapping.component)
-    })
 }
 
 fn mapping_text(mapping: &DrumMapping) -> String {
@@ -534,19 +479,19 @@ fn mapping_text(mapping: &DrumMapping) -> String {
     )
 }
 
-fn identity_text(identity: InputIdentity) -> String {
-    let value_label = if identity.kind == MappingEventKind::Note {
+fn input_text(input: ObservedMidiInput) -> String {
+    let value_label = if input.event_kind == MappingEventKind::Note {
         "Velocity"
     } else {
         "Value"
     };
     format!(
         "Type: {} | {}: {} | Channel: {} | {value_label}: {}",
-        identity.kind.label(),
-        identity.kind.label(),
-        identity.number,
-        identity.channel,
-        identity.value
+        input.event_kind.label(),
+        input.event_kind.label(),
+        input.number,
+        input.channel,
+        input.value
     )
 }
 
@@ -569,29 +514,23 @@ fn last_input_panel(ui: &mut egui::Ui, event: Option<&MidiEvent>, config: &DrumK
                 ui.weak("Waiting for MIDI input...");
                 return;
             };
-            let Some(identity) = input_identity(event) else {
+            let Some(input) = ObservedMidiInput::from_event(event) else {
                 ui.monospace(format!("Type: {}", event.message.kind.name()));
                 return;
             };
             let (message_type, number_label, value_label) =
-                if identity.kind == MappingEventKind::Note {
+                if input.event_kind == MappingEventKind::Note {
                     ("Note On", "Note", "Velocity")
                 } else {
                     ("Control Change", "Controller", "Value")
                 };
             ui.monospace(format!("Type: {message_type}"));
-            ui.monospace(format!("{number_label}: {}", identity.number));
-            ui.monospace(format!("Channel: {}", identity.channel));
-            ui.monospace(format!("{value_label}: {}", identity.value));
+            ui.monospace(format!("{number_label}: {}", input.number));
+            ui.monospace(format!("Channel: {}", input.channel));
+            ui.monospace(format!("{value_label}: {}", input.value));
             let interpretation = config
-                .mappings
-                .iter()
-                .find(|mapping| {
-                    mapping.event_kind == identity.kind
-                        && mapping.midi_note == identity.number
-                        && mapping.channel == identity.channel
-                })
-                .map(|mapping| mapping.component.label())
+                .resolve(input.identity())
+                .map(DrumComponent::label)
                 .unwrap_or("UNMAPPED");
             ui.label(format!("Interpretation: {interpretation}"));
         });

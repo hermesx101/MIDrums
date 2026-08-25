@@ -156,7 +156,7 @@ impl RhythmGrid {
         let written_beat = position.ticks_per_beat;
         let ticks_per_subdivision = self.ticks_per_subdivision(position_map);
         let measure_ticks = written_beat * beats as u64;
-        let slot_count = (measure_ticks + ticks_per_subdivision - 1) / ticks_per_subdivision;
+        let slot_count = measure_ticks.div_ceil(ticks_per_subdivision);
         let current_offset = (position.beat as u64 - 1) * written_beat + position.ticks_into_beat;
         let active_slot =
             (current_offset / ticks_per_subdivision).min(slot_count.saturating_sub(1));

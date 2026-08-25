@@ -25,10 +25,10 @@
 //!   the previous pad cannot slide into the *next* component's prompt.
 
 use super::{
-    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingArticulation,
-    MappingEventKind, MappingInputIdentity, SUPPORTED_COMPONENTS,
+    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingEventKind,
+    MappingInputIdentity, ObservedMidiInput, SUPPORTED_COMPONENTS,
 };
-use crate::midi::{MessageKind, MidiEvent};
+use crate::midi::MidiEvent;
 
 /// After a hit is accepted/retried, Note On events arriving within this window
 /// (relative to the original hit timestamp) are suppressed so they are not
@@ -57,30 +57,22 @@ impl DetectedHit {
     /// Converts a MIDI event into a drum hit according to the rules in the
     /// module docs, or `None` when the event is not a positive-velocity Note On.
     pub fn from_event(ev: &MidiEvent) -> Option<Self> {
-        let msg = &ev.message;
-        let (event_kind, midi_note, velocity) = match msg.kind {
-            MessageKind::NoteOn if msg.data2.unwrap_or(0) > 0 => {
-                (MappingEventKind::Note, msg.data1?, msg.data2.unwrap_or(0))
-            }
-            MessageKind::ControlChange => (
-                MappingEventKind::ControlChange,
-                msg.data1?,
-                msg.data2.unwrap_or(0),
-            ),
-            _ => return None,
-        };
-        if event_kind == MappingEventKind::Note && velocity == 0 {
-            // Note On with zero velocity == Note Off (MIDI convention).
-            return None;
-        }
-        let channel = msg.channel_number().unwrap_or(1);
+        let input = ObservedMidiInput::from_event(ev)?;
         Some(Self {
-            event_kind,
-            midi_note,
-            channel,
-            velocity,
+            event_kind: input.event_kind,
+            midi_note: input.number,
+            channel: input.channel,
+            velocity: input.value,
             timestamp_micros: ev.timestamp_micros,
         })
+    }
+
+    pub fn identity(self) -> MappingInputIdentity {
+        MappingInputIdentity {
+            event_kind: self.event_kind,
+            number: self.midi_note,
+            channel: self.channel,
+        }
     }
 }
 /// The current state of the setup wizard.
@@ -330,15 +322,10 @@ impl SetupWizard {
         };
         if self.state == SetupWizardState::Completed {
             self.test_hit = Some(hit);
-            self.test_component = self.accepted.iter().flatten().find_map(|mapping| {
-                mapping
-                    .matches(MappingInputIdentity {
-                        event_kind: hit.event_kind,
-                        number: hit.midi_note,
-                        channel: hit.channel,
-                    })
-                    .then_some(mapping.component)
-            });
+            self.test_component =
+                self.accepted.iter().flatten().find_map(|mapping| {
+                    mapping.matches(hit.identity()).then_some(mapping.component)
+                });
             if self.test_component.is_none() {
                 self.test_component = self.base_config.as_ref().and_then(|config| {
                     config.mappings.iter().find_map(|mapping| {
@@ -346,13 +333,8 @@ impl SetupWizard {
                             .iter()
                             .position(|component| *component == mapping.component)
                             .is_some_and(|index| !self.accepted[index].is_empty());
-                        (!component_was_replaced
-                            && mapping.matches(MappingInputIdentity {
-                                event_kind: hit.event_kind,
-                                number: hit.midi_note,
-                                channel: hit.channel,
-                            }))
-                        .then_some(mapping.component)
+                        (!component_was_replaced && mapping.matches(hit.identity()))
+                            .then_some(mapping.component)
                     })
                 });
             }
@@ -374,20 +356,20 @@ impl SetupWizard {
         }
         match self.state {
             SetupWizardState::Detecting(_) => {
-                if let Some(existing) = self.accepted.iter().flatten().find(|mapping| {
-                    mapping.event_kind == hit.event_kind
-                        && mapping.midi_note == hit.midi_note
-                        && mapping.channel == hit.channel
-                }) {
+                if let Some(existing) = self
+                    .accepted
+                    .iter()
+                    .flatten()
+                    .find(|mapping| mapping.matches(hit.identity()))
+                {
                     self.rejected = Some((hit, existing.component));
                     return false;
                 }
                 if let Some(existing) = self.base_config.as_ref().and_then(|config| {
-                    config.mappings.iter().find(|mapping| {
-                        mapping.event_kind == hit.event_kind
-                            && mapping.midi_note == hit.midi_note
-                            && mapping.channel == hit.channel
-                    })
+                    config
+                        .mappings
+                        .iter()
+                        .find(|mapping| mapping.matches(hit.identity()))
                 }) {
                     let owner_was_replaced = self.is_done(existing.component);
                     if existing.component != component && !owner_was_replaced {
@@ -468,7 +450,7 @@ impl SetupWizard {
             event_kind: hit.event_kind,
             midi_note: hit.midi_note,
             channel: hit.channel,
-            articulation: articulation_for(component),
+            articulation: component.default_articulation(),
             cc_range: self.cc_range,
         });
         self.suppress_until_micros = hit.timestamp_micros + HIT_DEBOUNCE_MICROS;
@@ -572,15 +554,6 @@ impl SetupWizard {
     }
 }
 
-fn articulation_for(component: DrumComponent) -> Option<MappingArticulation> {
-    match component {
-        DrumComponent::HiHat => Some(MappingArticulation::Closed),
-        DrumComponent::HiHatOpen => Some(MappingArticulation::Open),
-        DrumComponent::HiHatPedal => Some(MappingArticulation::Pedal),
-        DrumComponent::HiHatPedalPosition => Some(MappingArticulation::Continuous),
-        _ => None,
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

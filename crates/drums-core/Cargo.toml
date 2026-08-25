@@ -3,7 +3,7 @@ name = "drums-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Hardware-independent MIDI logic for the DRUMS practice application (Phase 1)."
+description = "Hardware-independent domain logic for MI Drums."
 
 [dependencies]
 midir.workspace = true
