@@ -2,8 +2,8 @@
 //! the interactive setup wizard.
 //!
 //! Everything in this module is pure logic — it has no GUI and no MIDI backend
-//! dependency — so the state machine in [`wizard`] and the persistence in
-//! [`store`] can be unit-tested independently of any front-end. It deliberately
+//! dependency — so [`SetupWizard`] and [`MappingStore`] can be unit-tested
+//! independently of any front-end. It deliberately
 //! makes *no* assumption that a particular MIDI note maps to a particular drum:
 //! the values are learned from the connected device during the setup wizard, or
 //! typed by hand in the manual mapping view.

@@ -1,3 +1,8 @@
+//! Track Library metadata and local TOML persistence.
+//!
+//! Entries reference source MIDI paths; this module never copies, moves, or
+//! deletes those files.
+
 use std::{
     fs,
     path::PathBuf,
@@ -6,6 +11,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+/// Persisted metadata for one referenced MIDI lesson.
+///
+/// `path` is the source-file identity and `display_name` is independently
+/// editable. Practice history summaries are cached for library sorting/display
+/// but completed sessions remain authoritative.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibraryEntry {
     pub path: String,
@@ -20,6 +30,7 @@ pub struct LibraryEntry {
     pub last_accuracy: Option<f64>,
 }
 
+/// User-selectable ordering for the in-memory Track Library view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibrarySort {
     RecentlyPlayed,
@@ -69,6 +80,8 @@ pub(crate) fn storage_path() -> PathBuf {
     PathBuf::from("track-library.toml")
 }
 
+/// Loads library records, returning an empty library when storage is absent,
+/// unreadable, or malformed.
 pub fn load() -> Vec<LibraryEntry> {
     fs::read_to_string(storage_path())
         .ok()
@@ -77,6 +90,7 @@ pub fn load() -> Vec<LibraryEntry> {
         .unwrap_or_default()
 }
 
+/// Persists all Track Library metadata without touching referenced MIDI files.
 pub fn save(entries: &[LibraryEntry]) -> std::io::Result<()> {
     let path = storage_path();
     if let Some(parent) = path.parent() {

@@ -1,7 +1,10 @@
+//! Multi-session progress charts derived from completed-session history.
+
 use crate::{DrumApp, View};
 use drums_core::TrackProgress;
 use eframe::egui;
 
+/// Loads and renders aggregate progress for the selected Track Library entry.
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let Some(track_id) = app.progress_track_path.clone() else {
         ui.heading("PROGRESS");

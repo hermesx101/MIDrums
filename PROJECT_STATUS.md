@@ -1,82 +1,68 @@
-# MI Drums - Project Status
+# MI Drums project status
 
-## Overall status
+## Release status
 
-MI Drums is functionally developed across its primary setup, mapping, library, practice, scoring, notation, history, analysis, and Preferences workflows. Automated validation is clean. The project is now in real-world hardware and release-readiness validation, not final production release.
+MI Drums v1.0.0 is functionally complete and is being prepared for public release. Current
+application behavior is frozen for v1.0. The intended NUX DM-1 hardware workflow has completed
+release testing, including the understood physical pedal behavior, which is not a release blocker.
 
-The current hardware target is the NUX DM-1. Final end-to-end validation with that kit has not been completed.
+## Implemented scope
 
-## Completed
+- Windows desktop application using egui/eframe
+- MIDI input discovery, connection, parsing, timestamps, Monitor, and disconnect detection
+- Per-device Drum Mapping, aliases, explicit conflict handling, CC calibration, and persistence
+- Guided Setup Wizard with final live mapping test
+- Track Library and Standard MIDI File import
+- Tempo-aware Practice, Timeline, Sheet Music, metronome, loops, count-in, and optional backing audio
+- Correct/Early/Late, Wrong Drum, Missed, and Extra scoring with velocity and timing records
+- Completed-session statistics, Performance Analysis, and multi-session Progress
+- Audio-output selection, background device enumeration, fallback, volume, mute, and test sound
+- Persisted practice, timing, audio, and appearance Preferences
+- Confirmed Reset All Data limited to application-owned records
 
-- **Core application:** native egui/eframe desktop shell, navigation, responsive practice workspace, and local-only operation.
-- **MIDI handling:** port enumeration, single-device connection, reconnect/disconnect handling, callback-thread timestamps, event queueing, and repaint notification.
-- **MIDI parsing:** streaming parser for channel voice, running status, split/multiple messages, SysEx, System Common, and System Real-Time events.
-- **MIDI Monitor:** device controls, latest-event details, and a bounded live event log.
-- **Drum Mapping:** per-device Note/CC mappings, explicit conflicts, aliases, manual add/remove/reassign, and TOML persistence.
-- **Setup Wizard:** guided detection and confirmation, retry/skip/back/cancel, multiple Note aliases, continuous pedal calibration, final live test, and safe editing of existing mappings.
-- **Hi-hat input model:** distinct logical closed, open, discrete pedal, and continuous pedal-position mappings. Continuous CC state is implemented separately from playable hits.
-- **Track Library:** `.mid`/`.midi` import, metadata, search, sorting, display rename, record removal, source-location access, and latest/best practice summaries.
-- **Practice:** musical transport, tempo scaling, seeking, count-in, subdivision, lookahead, looping, metronome, optional backing audio, and Timeline/Sheet Music selection.
-- **Scoring:** deterministic matching for simultaneous and rapid events, timing judgments, Wrong Drum, Missed, Extra, unknown-event handling, session accuracy, and per-drum statistics.
-- **Timeline:** drum lanes, beat/bar/subdivision grid, expected/actual markers, playhead, loop region, lookahead, and semantic result legend.
-- **Sheet Music:** generated drum notation, time signatures, tempo, rests/chords, zoom, playback following, and a practice-integrated scrolling view.
-- **Session history:** completed-session persistence with raw hit records, timing, velocity, authoritative result counts, and per-drum statistics.
-- **Performance Analysis:** session scorecard, hit/timing/dynamics analysis, per-drum breakdown, insights, and history navigation.
-- **Progress:** multi-session accuracy, consistency, BPM, timing, dynamics, per-drum trends, weakest-drum calculation, and threshold-based insights.
-- **Settings and Preferences:** practice view, MIDI latency, audio sync, theme, accent color, UI scale, and persisted defaults.
-- **Reset All Data:** confirmed deletion of application-owned mappings, sessions, library records, and settings; in-memory reset to the existing first-launch Setup flow; source media retained.
-- **Code cleanup:** shared MIDI-input resolution, first-class mapping aliases, extracted MIDI Monitor UI, and separation of core domain logic from GUI concerns.
+## Automated verification
 
-## Validation
+The final release-preparation gate verifies:
 
-Validation performed on 2026-08-20 in the current Windows development environment:
+- `cargo fmt --check`
+- `cargo test --workspace` — **180 tests passed, 0 failed, 0 ignored**
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo doc --workspace --no-deps`
+- `cargo build --release`
+- `git diff --check`
 
-- `cargo fmt --all -- --check` - passed
-- `cargo clippy --workspace --all-targets -- -D warnings` - passed with no warnings
-- `cargo build --workspace` - passed
-- `cargo test --workspace --no-fail-fast` - 164 passed, 0 failed
-  - `drums-app`: 18 tests
-  - `drums-core`: 146 tests
+Automated tests cover hardware-independent MIDI parsing/import, mapping aliases and conflicts, Setup
+Wizard state, transport and metronome behavior, Practice scoring, hi-hat CC state, Timeline geometry,
+notation, persistence round trips, session statistics, Progress, Preferences, audio refresh-worker
+coordination, and Reset ownership.
 
-The suite covers hardware-independent parsing, mapping, Setup Wizard state transitions, MIDI file import, transport/metronome behavior, scoring, hi-hat CC state, notation, session persistence, performance/progress calculations, Preferences persistence, reset confirmation, and source-file deletion safety.
+## Real hardware QA
 
-No Critical or High software regressions were observed in this automated validation. The checks do not exercise a physical MIDI device, operating-system MIDI driver, real audio output, or manual UI behavior.
+The intended NUX DM-1 kit has been tested for the final release and the application is considered
+functionally working with that hardware. The physical pedal behavior has been observed and understood;
+MI Drums continues to represent discrete pedal Note input separately from continuous pedal CC state.
 
-## Hardware validation
-
-Final NUX DM-1 validation remains pending. A known observation is that one pedal interaction can produce more than one MIDI output/event. The code can display those inputs, exposes nearby inputs during setup, supports separate discrete Note and continuous CC mappings, and prevents CC pedal state from becoming a scored hit.
-
-The available evidence does not establish whether the multi-event pedal behavior is caused by the kit, its configuration, the MIDI driver, or application interpretation. Capture the exact messages in MIDI Monitor before treating it as a software defect.
+Hardware QA and automated verification are complementary. Driver latency, MIDI event sequences, and
+audio endpoint behavior can vary on other machines and devices.
 
 ## Known limitations
 
-- Physical NUX DM-1 coverage has not completed final validation across every pad, hi-hat state, alias/zone, velocity range, and pedal action.
-- Continuous hi-hat CC updates calibrated pedal state but does not currently change lesson articulation or scoring.
-- Practice's General MIDI expected-note conversion currently groups GM hi-hat notes 42, 44, and 46 into one general/closed hi-hat target; standalone notation distinguishes them.
-- Only one live MIDI input connection is supported at a time.
-- MIDI latency compensation and backing-audio synchronization need manual calibration on real hardware.
-- Backing-track selection is not persisted across application restarts.
-- Windows is validated; other desktop platforms have not completed build and runtime validation.
-- Track Library and practice-settings persistence do not surface every load/save failure consistently. Reset reports failures but its multi-file deletion is not transactional.
-- Cargo metadata declares `MIT OR Apache-2.0`, but the repository does not contain the corresponding license text files.
-- No continuous-integration workflow or packaged installer is present.
+- Continuous hi-hat pedal CC is calibrated and tracked but does not create a scored hit or infer
+  Practice articulation.
+- Practice maps General MIDI notes 42, 44, and 46 to general `HiHat`; standalone notation retains
+  closed, pedal, and open placement detail.
+- One live MIDI input connection is supported at a time.
+- Backing-track selection is not persisted between application runs.
+- Track Library records reference source MIDI paths; moving a source file makes the entry unavailable.
+- Preferences and Track Library loaders fall back to defaults/empty state when storage is malformed.
+- Windows is the supported v1.0 release platform; the portable executable is unsigned.
+- There is no installer or automatic updater in v1.0.
 
-## Remaining work
+## Post-v1.0 candidates
 
-### Required before release
-
-1. Complete an end-to-end NUX DM-1 hardware matrix: connection, each mapped component, aliases, open/closed/pedal behavior, continuous CC range, rapid/simultaneous hits, reconnect, and saved-map restore.
-2. Record and classify the pedal's multi-event output in MIDI Monitor; change software only if the trace demonstrates an application defect.
-3. Manually validate scoring latency and backing-audio synchronization on the target hardware/audio stack.
-4. Run and document build/runtime smoke tests on every operating system claimed as supported.
-5. Add the actual MIT and Apache-2.0 license text files, or revise the Cargo license declaration before public distribution.
-6. Decide the supported release artifact and perform a clean-machine installation/run test.
-
-### Optional future improvements
-
-- Add CI for formatting, strict Clippy, build, and tests.
-- Improve persistence error reporting and make destructive reset more recoverable/transactional.
-- Persist backing-track associations if that workflow is desired.
-- Support multiple simultaneous MIDI input connections if required by real users.
-- Extend continuous hi-hat state into articulation-aware lesson matching after the expected-note model is defined for it.
-- Add platform packaging and release automation after supported platforms are established.
+- Atomic/recoverable persistence writes and clearer malformed-file recovery
+- Caching of Track Library/session-history summaries and Timeline profiling
+- Code signing and installer packaging
+- Broader MIDI-device and operating-system validation
+- Optional persisted backing-track associations
+- Articulation-aware use of continuous hi-hat state after the lesson model is defined

@@ -1,6 +1,13 @@
+//! Local TOML persistence for Practice, audio, and appearance preferences.
+//!
+//! `#[serde(default)]` on the settings model is the compatibility boundary for
+//! older or partial files. Loading currently falls back to defaults when the
+//! file is missing, unreadable, or malformed.
+
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path, path::PathBuf};
 
+/// Persisted selection of egui's system, dark, or light theme.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
@@ -20,6 +27,7 @@ impl ThemePreference {
     }
 }
 
+/// Persisted accent palette applied to both light and dark egui styles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccentColour {
@@ -50,6 +58,7 @@ impl AccentColour {
     }
 }
 
+/// Persisted application-wide egui zoom preset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiScale {
@@ -77,6 +86,11 @@ impl UiScale {
     }
 }
 
+/// Complete persisted preference schema for MI Drums.
+///
+/// Timing offsets change timestamp/audio alignment, not the practice matching
+/// window. `practice_view` is stored as a string to remain compatible with the
+/// existing TOML format.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PracticeSettings {
@@ -124,6 +138,7 @@ pub(crate) fn path() -> PathBuf {
     }
     PathBuf::from("practice-settings.toml")
 }
+/// Loads preferences, returning defaults if storage cannot be read or parsed.
 pub fn load() -> PracticeSettings {
     load_from(&path())
 }
@@ -135,6 +150,7 @@ pub(crate) fn load_from(path: &Path) -> PracticeSettings {
         .unwrap_or_default()
 }
 
+/// Persists the complete preference snapshot to the per-user TOML file.
 pub fn save(value: &PracticeSettings) -> std::io::Result<()> {
     save_to(&path(), value)
 }

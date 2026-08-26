@@ -1,11 +1,17 @@
 //! Musical transport, timing conversion, and GUI-independent timeline data.
 
+//! Tempo-aware playback state and musical-position conversion.
+//!
+//! `MusicalTransport` is the timing authority shared by Practice, Timeline,
+//! Sheet Music, metronome scheduling, and backing-audio synchronization.
+
 use std::time::Duration;
 
 use super::{ExpectedNote, MidiFile, MidiTiming, TempoEvent, TimeSignatureEvent};
 
 const DEFAULT_MICROS_PER_QUARTER: u32 = 500_000;
 
+/// User-visible playback state owned by [`MusicalTransport`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportState {
     Stopped,
@@ -23,6 +29,10 @@ pub struct MusicalPosition {
     pub ticks_per_beat: u64,
 }
 
+/// Bidirectional conversion between MIDI ticks and elapsed seconds.
+///
+/// Tempo events are normalized by tick. Timecode MIDI uses its fixed frame
+/// rate; ticks-per-quarter MIDI integrates every effective tempo segment.
 #[derive(Clone, Debug)]
 pub struct TempoMap {
     timing: MidiTiming,
@@ -218,6 +228,7 @@ pub struct TimelineEvent {
     pub position: MusicalPosition,
 }
 
+/// Expected-event data consumed by the application Timeline renderer.
 #[derive(Clone, Debug)]
 pub struct Timeline {
     pub events: Vec<TimelineEvent>,
@@ -241,6 +252,11 @@ impl Timeline {
     }
 }
 
+/// Tempo-aware transport for the currently selected MIDI track.
+///
+/// Advancement is driven by elapsed monotonic duration, never by GUI frame
+/// count. A practice BPM scales the source tempo map without rewriting musical
+/// ticks. Seek and loop operations clamp to the file's final tick.
 #[derive(Clone, Debug)]
 pub struct MusicalTransport {
     state: TransportState,

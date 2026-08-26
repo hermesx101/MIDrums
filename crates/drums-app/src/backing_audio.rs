@@ -1,3 +1,9 @@
+//! Optional backing-track playback synchronized to the musical transport.
+//!
+//! `BackingAudio` owns decoded media and its Rodio sink, but it does not own
+//! practice time. `DrumApp` seeks and controls it from `MusicalTransport`, the
+//! authoritative playback clock.
+
 use rodio::{Decoder, OutputStreamHandle, Sink, Source};
 use std::{
     fs::File,
@@ -6,6 +12,11 @@ use std::{
     time::Duration,
 };
 
+/// Decoded backing media and its current Rodio playback sink.
+///
+/// Track volume/mute are independent of the application-wide output gain.
+/// Loading a file affects only the current practice context and is not
+/// persisted in Track Library.
 pub struct BackingAudio {
     handle: Option<OutputStreamHandle>,
     sink: Option<Sink>,

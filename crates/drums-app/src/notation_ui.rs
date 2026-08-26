@@ -1,3 +1,8 @@
+//! egui renderer for standalone and Practice-integrated drum Sheet Music.
+//!
+//! The notation model comes from `drums-core`; this module only lays it out,
+//! paints feedback, and optionally follows the active transport system.
+
 use crate::{DrumApp, View};
 use drums_core::{
     DrumComponent, DrumNotationScore, NotationDrumNote, NotationMeasure, PracticeResult,
@@ -19,6 +24,7 @@ struct StaffGeometry {
     zoom: f32,
 }
 
+/// Renders the standalone Sheet Music page and its transport/follow controls.
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let Some(score) = app.notation_score.clone() else {
         ui.heading("DRUM SHEET MUSIC");
@@ -117,6 +123,11 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
 
 /// Practice visualization only: transport and evaluation remain owned by the
 /// existing practice engine, and this consumes their read-only state.
+/// Renders notation for the active PracticeSession.
+///
+/// Results are the same authoritative outcomes used by Timeline. When follow
+/// mode is enabled, the response for the active system is scrolled into view;
+/// this function never advances transport state.
 pub fn show_practice_score(
     ui: &mut egui::Ui,
     score: &DrumNotationScore,

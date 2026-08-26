@@ -41,6 +41,28 @@ MIDI file
 
 The GUI is the orchestrator, but scoring and timing rules stay in `drums-core`. Audio follows transport state; it is not the timing authority.
 
+The audio-routing flow is independent of MIDI input:
+
+```text
+PracticeSettings
+  -> preferred Audio Output name + global volume/mute
+  -> background CPAL device snapshot
+  -> AudioOutput route and shared Rodio handle
+  -> ClickAudio (metronome/test sound)
+  -> BackingAudio
+```
+
+The persistence/startup flow is:
+
+```text
+local TOML files
+  -> preferences + mappings + Track Library loaded at startup
+  -> Setup page when no usable saved mapping exists; otherwise Track Library
+  -> exact device-name mapping restored on connection
+  -> completed PracticeSession appended to session history
+  -> Performance Analysis and Progress derived from that history
+```
+
 ## 2. Project structure
 
 ```text
@@ -80,6 +102,7 @@ crates/
       preferences_ui.rs
       practice_settings.rs
       track_library.rs
+      audio_output.rs
       click_audio.rs
       backing_audio.rs
 Files/
@@ -123,6 +146,7 @@ Files/
 | `preferences_ui.rs` | Dedicated Preferences page and confirmed application-data reset. |
 | `practice_settings.rs` | Persisted timing, view, audio-start, theme, accent, and scale settings. |
 | `track_library.rs` | Track Library record model and persistence. |
+| `audio_output.rs` | Background output-device discovery, preferred/default route selection, global output gain, and shared Rodio handle ownership. |
 | `click_audio.rs` | Synthesized metronome click playback through rodio. |
 | `backing_audio.rs` | Decoded backing-audio lifecycle, transport controls, seek, volume, and mute. |
 
@@ -137,6 +161,12 @@ The callback sends events over `std::sync::mpsc` and requests an egui repaint. I
 `ObservedMidiInput::from_event` is the shared filter used by Setup, mapping, diagnostics, and mapping resolution. It accepts positive-velocity Note On and Control Change messages. It rejects Note Off, zero-velocity Note On, and unrelated message kinds.
 
 The application periodically re-enumerates devices and closes a connection whose saved port name is no longer present. This is a best-effort portability mechanism because `midir` does not expose one uniform unplug notification across all backends.
+
+`MessageKind` distinguishes Note On, Note Off, Control Change, program/pitch messages, system
+messages, and unknown data. MIDI's Note On with velocity zero convention is normalized as Note Off
+by the event helpers and ignored as a playable mapping input. Velocity and CC value remain raw
+7-bit values. Monitor rows display events before mapping, making MIDI Monitor the boundary to check
+before debugging logical-drum resolution.
 
 ## 4. Drum Mapping architecture
 
@@ -177,6 +207,29 @@ The wizard progresses through `SUPPORTED_COMPONENTS`. All playable components li
 
 Each accepted component can retain multiple Note aliases. A wizard created with an existing configuration protects its inputs from accidental reuse and preserves skipped baseline components. At completion, the UI builds and validates the configuration, saves it through `MappingStore`, then marks the wizard finished and makes the saved configuration active.
 
+The fixed wizard order is Crash, Ride, Hi-Hat, Open Hi-Hat, Hi-Hat Pedal, Hi-Hat Pedal Position,
+Snare, Kick, High Tom, Mid Tom, and Low Tom. Playable components detect positive-velocity Note On;
+Hi-Hat Pedal Position detects CC and accumulates its observed minimum/maximum for calibration.
+
+```text
+Intro
+  -> Detecting(component)
+  -> Confirming(component)
+       -> accept -> Detecting(next component)
+       -> accept and add another -> Detecting(same component)
+       -> retry -> Detecting(same component)
+       -> back -> Detecting(previous component)
+       -> skip -> Detecting(next component)
+  -> Completed (live test/review)
+  -> validate + save -> Track Library
+
+Any active state -> cancel -> Canceled
+```
+
+Inputs already owned by another learned or baseline component are retained as rejected diagnostics
+rather than reassigned implicitly. The boundary timestamp and debounce interval prevent events from
+the prior step or a flam/double trigger from being accepted for the next prompt.
+
 ## 7. Practice engine
 
 `MidiFile::expected_notes_for_track` creates the expected side of practice. `DrumApp::rebuild_timeline` uses those same notes for `PracticeSession`, Timeline, notation, and automatic subdivision suggestion.
@@ -202,19 +255,83 @@ A same-component candidate becomes `CorrectHit` with `TimingJudgment::Good`, `Ea
 
 `PracticePerformance` derives live counts and accuracy. `CompletedPracticeSession` creates the analysis-ready durable snapshot. Accuracy is correct divided by finalized known targets; extras do not enlarge that denominator.
 
-## 9. Timeline
+## 9. MusicalTransport
+
+`MusicalTransport` owns playback state, current/final tick, a `TempoMap`, a
+`MusicalPositionMap`, and an optional practice BPM override. Its states are:
+
+- `Stopped`: positioned at tick zero after `stop`; `play` starts advancement.
+- `Playing`: `DrumApp::update` advances it from monotonic elapsed wall time.
+- `Paused`: retains its current tick; `play` resumes from that position.
+
+`seek` accepts a signed tick, clamps it into the song, and retains the current transport state.
+Seeking to the final tick makes a subsequent `play` a defined no-op until repositioned. `stop`
+returns to zero. `advance_by_looping` converts elapsed seconds through the active tempo model and,
+for a valid loop region, wraps while preserving overshoot and playing state.
+
+The source MIDI tempo map supports tempo changes. A practice BPM override scales musical time
+without rewriting MIDI ticks; current BPM and elapsed seconds are derived from the transport.
+`MusicalPositionMap` converts ticks into bar, beat, and tick positions using time-signature events.
+The UI sends commands and renders transport state, but frame count never determines score timing.
+On seek, stop, or loop wrap, `DrumApp` explicitly synchronizes PracticeSession, Metronome, and
+backing-audio state.
+
+## 10. Timeline
 
 `Timeline` in `drums-core` is a small data model: expected events with calculated musical positions plus a final tick. `midi_file_ui.rs` owns painting.
 
 The painter computes shared label/grid geometry, renders fixed logical-drum lanes, a subdivision-aware grid, expected notes, missed-note marks, actual result overlays, loop bounds, a playhead, and the semantic legend. It uses transport time rather than frame count. Recent results are bounded for rendering while complete result history remains in the core session.
 
-## 10. Sheet Music
+`DrumApp::rebuild_timeline` creates the core `Timeline` and `PracticeSession` from the same expected
+notes. `rhythm_grid` in `midi_file_ui.rs` performs egui painting. Lane and x-position helpers keep
+expected notes and actual unquantized hit times aligned to one time window; the playhead comes from
+`MusicalTransport`. Horizontal geometry reserves a stable label region before converting time to x
+coordinates. Timeline rendering currently performs per-frame preparation and is a known profiling
+candidate, but its architecture is intentionally unchanged for v1.0.
+
+## 11. Sheet Music
 
 `notation.rs` converts recognized notes into `DrumNotationScore`: tempos, measures, signatures, quantized slots, rests, rhythmic values, and drum-note chords. This is an intermediate representation; `notation_ui.rs` performs the egui painting.
 
 The standalone view can play/pause, zoom, follow playback, and enter Practice. In Sheet Music Practice, `main.rs` keeps the practice header outside the vertical scroll area. Only notation content scrolls, while transport, session feedback, audio, and metronome controls remain visible. Result overlays are derived from the same `PracticeResult` values used by the Timeline.
 
-## 11. Persistence
+Scrolling manually suspends automatic following for three seconds. Follow Playback scrolls the
+currently active system into view; it does not own or advance playback. Zoom is bounded to 70-200%.
+Notation quantization changes only the derived notation representation, never MIDI source ticks or
+the timestamps used by scoring.
+
+## 12. Audio architecture
+
+`AudioOutput` owns the current Rodio `OutputStream`/handle, preferred device name, enumerated device
+handles, active route, fallback status, global volume/mute, and `ClickAudio`. `BackingAudio` receives
+a clone of the same output handle. Changing the application gain updates both consumers; backing
+audio also has independent track volume and mute.
+
+At startup, `AudioOutput` opens the system default endpoint without enumerating every device. One
+persistent `AudioDeviceRefreshWorker` owns a bounded request channel and runs CPAL
+`output_devices()` calls on its named background thread. It returns an `AudioDeviceSnapshot`
+containing display names and device handles and requests an egui repaint. The frame update polls the
+result channel without blocking and applies only completed snapshots. Manual refreshes are
+coalesced while a request is active; periodic refreshes use the same worker.
+
+This separation is an important invariant: **CPAL device enumeration must not run synchronously on
+the egui/UI thread.** Some audio backends or disconnected endpoints can make enumeration slow. A
+synchronous call in a frame handler freezes interaction; the current worker architecture prevents
+that regression.
+
+Route planning has three states: requested named device, system default, or system-default fallback
+while retaining an unavailable named preference. Applying a route change recreates the shared
+output and asks `BackingAudio` to use it. Enumeration/open errors are reported through the existing
+status/notice path. Test Audio and metronome clicks are synthesized by `ClickAudio`; backing files
+are decoded by Rodio and are not persisted with a Track Library entry.
+
+## 13. Track Library and persistence
+
+Track Library entries store source path, display name, imported MIDI metadata, added/last-practiced
+time, and last accuracy. Import parses the selected file before adding it and avoids duplicate path
+records. Search and sorting operate on an in-memory copy for presentation. Rename and removal change
+only library metadata; source MIDI files are never renamed or deleted. Opening an entry reparses its
+source path. A missing, moved, unreadable, or invalid source is reported as an import/open error.
 
 All application persistence is local TOML; there is no database.
 
@@ -229,17 +346,44 @@ Windows normally places these below the user's application-data `drums` director
 
 Track records contain source paths. They do not own the referenced files. Backing-audio selection is held in memory and is not part of persisted Track Library data.
 
-Session writes report errors to the UI. Mapping loads/saves are validated. Some Track Library and practice-settings call sites deliberately fall back or ignore non-critical errors; this is tracked as technical debt.
+Session writes and Track Library writes on import/edit/completion report failures in the status UI.
+Mapping loads/saves are validated. Preferences are saved from user-facing controls, with dedicated
+Preferences edits reporting failures. Practice-settings and Track Library loaders currently return
+defaults/empty data if the file cannot be read or parsed; this recovery behavior can conceal a
+malformed file and is documented as a limitation rather than changed for v1.0.
 
-## 12. Settings and Preferences
+## 14. Settings and Preferences
 
-`practice_settings.rs` uses one serde/TOML model for MIDI input latency, audio sync offset, automatic backing-audio start, selected practice visualization, theme, accent color, and UI scale. `#[serde(default)]` keeps older/partial files compatible.
+`practice_settings.rs` uses one serde/TOML model for MIDI input latency, audio sync offset,
+automatic backing-audio start, Timeline/Sheet Music selection, expected-drums-only Timeline
+filtering, preferred output device, application volume/mute, theme, accent colour, and UI scale.
+`#[serde(default)]` keeps older/partial files compatible.
 
 `preferences_ui.rs` edits the appearance fields and calls `apply_app_appearance` in `main.rs`. Theme is applied through egui's system/dark/light selection, scale through the global zoom factor, and the selected accent through shared style colors.
 
 Reset All Data enumerates only known application-owned paths. It removes mapping TOML records plus the session, library, and settings files. On complete success, `DrumApp::restore_first_launch_after_reset` clears in-memory state, restores defaults, and routes to Setup. Deletion is deliberately scoped so source MIDI/audio paths are not targets.
 
-## 13. Testing
+Reset requires a modal confirmation. It does not restart the process. After complete deletion the
+running app disconnects MIDI, clears mapping/wizard/monitor/practice/library/history-derived state,
+unloads backing audio, restores default appearance/timing/audio preferences, requests an audio
+refresh, and shows Setup. If any deletion fails, it reports an incomplete reset and does not perform
+the in-memory first-launch restoration. Non-TOML files in the mappings directory are left alone.
+
+## 15. Startup and UI ownership
+
+`main` creates the eframe window and `DrumApp::new` loads settings, enumerates MIDI ports, applies
+appearance, checks saved mappings, opens initial audio, starts the background device worker, loads
+Track Library, and chooses Setup or Track Library. A single discovered MIDI port is selected but
+not connected automatically. On connect, the exact device-name mapping is loaded; an absent or
+unusable mapping starts Setup immediately.
+
+`DrumApp::update` is the orchestration boundary. It drains MIDI events, applies completed audio
+snapshots, advances transport by elapsed monotonic time, handles count-in/loop/metronome/backing
+audio synchronization, advances the PracticeSession, persists completion, and delegates rendering
+to the selected view module. Avoid moving domain rules into this function: mapping, timing,
+matching, notation conversion, statistics, and progress belong in `drums-core`.
+
+## 16. Testing
 
 Tests are colocated with modules under `#[cfg(test)]`.
 
@@ -258,7 +402,7 @@ cargo test --workspace --no-fail-fast
 
 Physical MIDI/audio behavior and rendered UI interaction still require manual validation.
 
-## 14. Where to make changes
+## 17. Where to make changes
 
 | Change | Start here |
 | --- | --- |
@@ -282,7 +426,18 @@ Physical MIDI/audio behavior and rendered UI interaction still require manual va
 | Performance or Progress screens | `crates/drums-app/src/performance_analysis_ui.rs`, `progress_ui.rs` |
 | Track Library persistence | `crates/drums-app/src/track_library.rs` |
 | Preferences schema/application | `crates/drums-app/src/practice_settings.rs`, `preferences_ui.rs`, `main.rs` |
+| Audio-device discovery or route selection | `crates/drums-app/src/audio_output.rs` |
 | Backing audio or click playback | `crates/drums-app/src/backing_audio.rs`, `click_audio.rs` |
 | Navigation and cross-feature orchestration | `crates/drums-app/src/main.rs` |
 
 When changing domain behavior, add or update a `drums-core` test before changing its UI representation. Keep MIDI callback work bounded and keep user-file paths outside application-owned deletion logic.
+
+Also preserve these cross-module invariants:
+
+- `MusicalTransport` and callback-derived timestamps are timing authorities; egui frame count is not.
+- Physical MIDI identity must pass through `DrumKitConfiguration` before scoring.
+- One logical drum may own several physical aliases, but one physical identity has one owner.
+- Continuous pedal CC updates state and does not pass through `record_hit`.
+- Timeline and Sheet Music are views over the same transport/session, not separate practice engines.
+- Progress and Performance Analysis derive from completed-session history rather than mutable UI state.
+- CPAL enumeration stays on `AudioDeviceRefreshWorker`, never in a UI callback.

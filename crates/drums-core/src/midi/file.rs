@@ -325,7 +325,7 @@ impl MidiFile {
     }
 }
 
-/// Interprets the common General MIDI percussion notes supported by DRUMS.
+/// Interprets the common General MIDI percussion notes supported by MI Drums.
 ///
 /// This intentionally maps musical roles, not a user's hardware note
 /// assignments. The latter remain in [`DrumKitConfiguration`].

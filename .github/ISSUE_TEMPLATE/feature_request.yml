@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an improvement to MI Drums
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user problem or limitation are you experiencing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: Describe the result you would like, without requiring a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Rationale and alternatives
+      description: Why would this help, and what workarounds have you tried?
+  - type: input
+    id: hardware
+    attributes:
+      label: Relevant MIDI hardware
+      description: Optional; include the model if the request is hardware-specific.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and requests.
+          required: true

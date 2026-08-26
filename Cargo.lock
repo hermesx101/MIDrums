@@ -1027,7 +1027,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "drums-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "drums-core",
  "eframe",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "drums-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "midir",
  "midly",

@@ -1,3 +1,8 @@
+//! Detailed view of one persisted completed practice session.
+//!
+//! Statistics are read from `PracticeSessionStore`; this module formats and
+//! visualizes them without maintaining a second authoritative result model.
+
 use crate::{DrumApp, View};
 use drums_core::{CompletedPracticeSession, DrumComponent, DrumSessionStatistics};
 use eframe::egui;
@@ -12,6 +17,7 @@ const WRONG_DRUM: egui::Color32 = egui::Color32::from_rgb(244, 82, 118);
 const MISSED: egui::Color32 = egui::Color32::from_rgb(120, 124, 135);
 const EXTRA: egui::Color32 = egui::Color32::from_rgb(165, 105, 220);
 
+/// Renders Performance Analysis for the selected track/session.
 pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     ui.set_width(ui.available_width());
     report(app, ui);

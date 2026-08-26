@@ -131,7 +131,12 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Application state. GUI-only; no MIDI processing happens here.
+/// Top-level desktop state and cross-feature orchestration boundary.
+///
+/// Hardware-independent parsing, mapping, transport, and scoring rules live in
+/// `drums-core`. This type owns their active instances, drains callback events
+/// on the UI thread, coordinates audio/session persistence, and delegates each
+/// view to its UI module.
 struct DrumApp {
     clock: SharedClock,
     backend: MidiBackend,
@@ -216,6 +221,8 @@ struct DrumApp {
     notation_follow_suspended_until: Option<Instant>,
     practice_visual: PracticeVisual,
     audio_output: audio_output::AudioOutput,
+    audio_device_refresh: audio_output::AudioDeviceRefreshWorker,
+    manual_audio_refresh_pending: bool,
     last_audio_output_refresh: Instant,
     backing_audio: backing_audio::BackingAudio,
     audio_sync_offset_ms: f64,
@@ -325,6 +332,8 @@ impl DrumApp {
         self.audio_output
             .select_device(defaults.audio_output_device.clone());
         let _ = self.sync_backing_audio_output();
+        self.manual_audio_refresh_pending = false;
+        self.request_audio_output_refresh(false);
         self.last_audio_output_refresh = Instant::now();
 
         self.midi_input_latency_ms = defaults.midi_input_latency_ms;
@@ -373,6 +382,58 @@ impl DrumApp {
         )
     }
 
+    fn save_track_library(&mut self) -> bool {
+        match track_library::save(&self.track_library) {
+            Ok(()) => true,
+            Err(error) => {
+                self.status = format!("Could not save Track Library: {error}");
+                false
+            }
+        }
+    }
+
+    fn request_audio_output_refresh(&mut self, manual: bool) -> bool {
+        let started = self.audio_device_refresh.request_refresh();
+        if manual && (started || self.audio_device_refresh.is_refreshing()) {
+            self.manual_audio_refresh_pending = true;
+        }
+        started
+    }
+
+    fn audio_output_refresh_in_flight(&self) -> bool {
+        self.audio_device_refresh.is_refreshing()
+    }
+
+    fn apply_completed_audio_device_refresh(&mut self) {
+        let Some(result) = self.audio_device_refresh.try_take_latest() else {
+            return;
+        };
+        let manual = std::mem::take(&mut self.manual_audio_refresh_pending);
+        let update = match result {
+            Ok(snapshot) => self.audio_output.apply_device_snapshot(snapshot),
+            Err(error) => self.audio_output.apply_refresh_error(error),
+        };
+        if update.route_changed {
+            self.status = match self.sync_backing_audio_output() {
+                Err(error) => {
+                    format!("Audio output changed, but backing audio could not be routed: {error}")
+                }
+                Ok(()) => update.notice.unwrap_or_else(|| {
+                    format!(
+                        "Audio output changed to {}.",
+                        self.audio_output
+                            .active_device()
+                            .unwrap_or(audio_output::DEFAULT_SYSTEM_DEVICE)
+                    )
+                }),
+            };
+        } else if let Some(notice) = update.notice {
+            self.status = notice;
+        } else if manual {
+            self.status = "Audio output devices refreshed.".into();
+        }
+    }
+
     fn apply_audio_output_gain(&mut self) {
         self.backing_audio
             .set_output_gain(self.audio_output.effective_gain());
@@ -418,6 +479,12 @@ impl DrumApp {
         );
         let backing_audio =
             backing_audio::BackingAudio::new(audio_output.handle(), audio_output.effective_gain());
+        let audio_refresh_ctx = ctx.egui_ctx.clone();
+        let mut audio_device_refresh =
+            audio_output::AudioDeviceRefreshWorker::new(Arc::new(move || {
+                audio_refresh_ctx.request_repaint()
+            }));
+        audio_device_refresh.request_refresh();
         let status = match (status.is_empty(), audio_output.notice()) {
             (true, Some(notice)) => notice.to_string(),
             (false, Some(notice)) => format!("{status} {notice}"),
@@ -505,6 +572,8 @@ impl DrumApp {
                 PracticeVisual::Timeline
             },
             audio_output,
+            audio_device_refresh,
+            manual_audio_refresh_pending: false,
             last_audio_output_refresh: Instant::now(),
             backing_audio,
             audio_sync_offset_ms: practice_settings.audio_sync_offset_ms,
@@ -693,7 +762,7 @@ impl DrumApp {
                         last_practiced_at: None,
                         last_accuracy: None,
                     });
-                    let _ = track_library::save(&self.track_library);
+                    self.save_track_library();
                 }
                 self.library_selected_path = Some(path.to_string_lossy().into_owned());
                 self.midi_import_error = None;
@@ -893,7 +962,7 @@ impl DrumApp {
                 {
                     entry.last_accuracy = Some(accuracy);
                     entry.last_practiced_at = Some(completed_at_unix_ms / 1_000);
-                    let _ = track_library::save(&self.track_library);
+                    self.save_track_library();
                 }
                 self.status = format!("Practice session saved ({accuracy:.1}% accuracy).");
             }
@@ -961,31 +1030,11 @@ impl eframe::App for DrumApp {
             }
         }
 
+        self.apply_completed_audio_device_refresh();
         let now = Instant::now();
         if now.duration_since(self.last_audio_output_refresh) >= AUDIO_OUTPUT_REFRESH_INTERVAL {
             self.last_audio_output_refresh = now;
-            let update = self.audio_output.refresh_devices();
-            if update.route_changed {
-                match self.sync_backing_audio_output() {
-                    Err(error) => {
-                        self.status = format!(
-                            "Audio output changed, but backing audio could not be routed: {error}"
-                        );
-                    }
-                    Ok(()) => {
-                        self.status = update.notice.unwrap_or_else(|| {
-                            format!(
-                                "Audio output restored to {}.",
-                                self.audio_output
-                                    .active_device()
-                                    .unwrap_or(audio_output::DEFAULT_SYSTEM_DEVICE)
-                            )
-                        });
-                    }
-                }
-            } else if let Some(notice) = update.notice {
-                self.status = notice;
-            }
+            self.request_audio_output_refresh(false);
         }
         if self.view == View::Practice {
             self.begin_session_recording_if_needed();

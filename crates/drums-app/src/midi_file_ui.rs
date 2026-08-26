@@ -325,7 +325,7 @@ fn library_edit_prompts(app: &mut DrumApp, ui: &mut egui::Ui) {
                         entry.display_name = name.to_string();
                     }
                 }
-                let _ = crate::track_library::save(&app.track_library);
+                app.save_track_library();
                 app.library_rename_path = None;
             }
             if ui.button("Cancel").clicked() {
@@ -353,7 +353,7 @@ fn library_edit_prompts(app: &mut DrumApp, ui: &mut egui::Ui) {
                 if app.library_selected_path.as_deref() == Some(path.as_str()) {
                     app.library_selected_path = None;
                 }
-                let _ = crate::track_library::save(&app.track_library);
+                app.save_track_library();
                 app.library_remove_path = None;
             }
         });
@@ -584,7 +584,6 @@ fn practice_content(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[ExpectedNo
                 app.view = View::PerformanceAnalysis;
             }
         });
-        practice_debug_details(app, ui);
         return;
     }
 
@@ -634,7 +633,6 @@ fn practice_content(app: &mut DrumApp, ui: &mut egui::Ui, expected: &[ExpectedNo
             }
         }
     }
-    practice_debug_details(app, ui);
 }
 
 fn practice_metronome_strip(app: &mut DrumApp, ui: &mut egui::Ui) {
@@ -1788,45 +1786,6 @@ fn practice_feedback_bar(app: &DrumApp, ui: &mut egui::Ui) {
                 });
         },
     );
-}
-
-fn practice_debug_details(app: &DrumApp, ui: &mut egui::Ui) {
-    let Some(transport) = app.transport.as_ref() else {
-        return;
-    };
-    egui::CollapsingHeader::new("Debug / Details")
-        .default_open(false)
-        .show(ui, |ui| {
-            let (numerator, denominator) = transport
-                .position_map()
-                .time_signature_at_tick(transport.current_tick());
-            ui.monospace(format!(
-                "State: {:?} | Tick: {} / {} | Time signature: {}/{} | PPQ: {:?}",
-                transport.state(),
-                transport.current_tick(),
-                transport.final_tick(),
-                numerator,
-                denominator,
-                transport.position_map().ticks_per_quarter()
-            ));
-            if let Some(session) = &app.practice_session {
-                ui.monospace(format!(
-                    "Pending: {} | Results: {} | Match window: +/-{} ms",
-                    session.pending_count(),
-                    session.results().len(),
-                    session.matching_window().as_millis()
-                ));
-            }
-            if let Some(hit) = &app.last_live_hit {
-                ui.monospace(format!(
-                    "Last input: MIDI {} | channel {} | velocity {} | tick {}",
-                    hit.received_midi_note,
-                    hit.channel + 1,
-                    hit.velocity,
-                    hit.transport_tick
-                ));
-            }
-        });
 }
 
 fn show_last_result(ui: &mut egui::Ui, result: &drums_core::PracticeResult) {

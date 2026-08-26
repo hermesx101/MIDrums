@@ -1,5 +1,14 @@
 target/
+dist/
+release-staging/
+*.zip
+*.sha256
 *.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
 
 # Local environment files
 .env

@@ -13,6 +13,7 @@ use crate::{
     Subdivision, TimingJudgment,
 };
 
+/// Durable representation of one finalized expected/actual outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PracticeHitRecord {
     pub sequence: usize,
@@ -29,6 +30,7 @@ pub struct PracticeHitRecord {
     pub timing_judgment: Option<TimingJudgment>,
 }
 
+/// Aggregate statistics for one logical drum within a completed session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DrumSessionStatistics {
     pub finalized_count: usize,
@@ -46,6 +48,7 @@ pub struct DrumSessionStatistics {
     pub maximum_velocity: Option<u8>,
 }
 
+/// Authoritative aggregate snapshot stored with a completed session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionStatistics {
     pub accuracy: f64,
@@ -78,6 +81,7 @@ pub struct SessionBuildMetadata {
     pub subdivision: Subdivision,
 }
 
+/// Append-only persisted snapshot of one completed practice attempt.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompletedPracticeSession {
     pub id: String,
@@ -302,6 +306,10 @@ struct SessionFile {
     sessions: Vec<CompletedPracticeSession>,
 }
 
+/// TOML-backed local store for completed practice-session history.
+///
+/// Appends preserve earlier sessions. Progress and Performance Analysis query
+/// this store rather than maintaining independent result histories.
 pub struct PracticeSessionStore {
     path: PathBuf,
 }

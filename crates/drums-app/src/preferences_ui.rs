@@ -160,6 +160,7 @@ fn show_audio_preferences(app: &mut DrumApp, ui: &mut egui::Ui) {
     let mut muted = app.audio_output.muted();
     let mut refresh_devices = false;
     let mut test_audio = false;
+    let refreshing_devices = app.audio_output_refresh_in_flight();
 
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12, 9))
@@ -201,7 +202,16 @@ fn show_audio_preferences(app: &mut DrumApp, ui: &mut egui::Ui) {
                                     );
                                 }
                             });
-                        refresh_devices = ui.small_button("Refresh").clicked();
+                        refresh_devices = ui
+                            .add_enabled(
+                                !refreshing_devices,
+                                egui::Button::new(if refreshing_devices {
+                                    "Refreshing..."
+                                } else {
+                                    "Refresh"
+                                }),
+                            )
+                            .clicked();
                     });
                     ui.end_row();
 
@@ -239,7 +249,10 @@ fn show_audio_preferences(app: &mut DrumApp, ui: &mut egui::Ui) {
     let mut settings_changed = false;
     if selected_device != current_preference {
         let update = app.audio_output.select_device(selected_device);
-        let route_error = app.sync_backing_audio_output().err();
+        let route_error = update
+            .route_changed
+            .then(|| app.sync_backing_audio_output().err())
+            .flatten();
         app.status = if let Some(error) = route_error {
             format!("Audio output changed, but backing audio could not be routed: {error}")
         } else if let Some(notice) = update.notice {
@@ -266,14 +279,12 @@ fn show_audio_preferences(app: &mut DrumApp, ui: &mut egui::Ui) {
         settings_changed = true;
     }
     if refresh_devices {
-        let update = app.audio_output.refresh_devices();
-        let route_error = app.sync_backing_audio_output().err();
-        app.status = if let Some(error) = route_error {
-            format!("Audio devices refreshed, but backing audio could not be routed: {error}")
-        } else if let Some(notice) = update.notice {
-            notice
+        app.status = if app.request_audio_output_refresh(true) {
+            "Refreshing audio output devices...".into()
+        } else if app.audio_output_refresh_in_flight() {
+            "Audio output refresh already in progress...".into()
         } else {
-            "Audio output devices refreshed.".into()
+            "Audio output refresh worker is unavailable.".into()
         };
     }
     if test_audio {

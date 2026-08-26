@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::mapping::{DrumComponent, DrumKitConfiguration, MappingEventKind, ObservedMidiInput};
 use crate::midi::{ExpectedNote, MessageKind, MidiEvent, MusicalTransport};
 
+/// A playable live Note On converted from callback time into transport time.
+///
+/// `drum_component` is resolved through the connected kit configuration; the
+/// raw received note is retained only for diagnostics and durable history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActualHit {
     pub received_midi_note: u8,
@@ -63,6 +67,10 @@ impl ActualHit {
     }
 }
 
+/// Final outcome assigned to an expected or actual practice event.
+///
+/// `Ignored` represents Extra actual hits as well as unknown expected notes;
+/// callers distinguish them by the presence of `actual` and `expected`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PracticeResultKind {
     CorrectHit,
@@ -78,6 +86,7 @@ pub enum TimingJudgment {
     Late,
 }
 
+/// Inclusive central and outer timing windows used during matching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimingConfig {
     pub good_window: Duration,
@@ -129,6 +138,7 @@ pub struct PracticeTarget {
     pub total_matchable: usize,
 }
 
+/// Immutable record produced when a hit is matched or an event is finalized.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PracticeResult {
     pub kind: PracticeResultKind,
@@ -159,6 +169,11 @@ pub struct HiHatPedalState {
     pub timestamp_micros: u64,
 }
 
+/// Stateful matcher for one practice attempt.
+///
+/// Expected notes are sorted once and consumed at most once per encounter.
+/// Loop-wrap and seek methods explicitly re-arm the appropriate region while
+/// preserving already-produced results where required.
 #[derive(Clone, Debug)]
 pub struct PracticeSession {
     expected: Vec<ExpectedNote>,
