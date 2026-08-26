@@ -4,6 +4,10 @@ MI Drums is a native desktop MIDI drum practice application for electronic drum 
 
 MI Drums runs locally and does not require a server or cloud account.
 
+![MIDrums Timeline](docs/images/practice-timeline.png)
+
+![MIDrums Sheet Music](docs/images/sheet-music.png)
+
 ## Features
 
 - MIDI device detection and live MIDI Monitor
