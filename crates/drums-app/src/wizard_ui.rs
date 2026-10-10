@@ -1,6 +1,9 @@
 //! Guided, visual setup flow over the core `SetupWizard` state machine.
 
-use drums_core::mapping::{DrumComponent, SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS};
+use drums_core::mapping::{
+    DrumComponent, DrumKitConfiguration, HiHatPedalMode, SetupWizard, SetupWizardState,
+    SUPPORTED_COMPONENTS,
+};
 use eframe::egui;
 
 use crate::{DrumApp, View};
@@ -20,16 +23,31 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
         ui.heading("SETUP WIZARD");
         ui.label(format!("Connected device: {device}"));
         ui.label("The wizard will ask you to hit each playable drum or hi-hat state.");
+        let mut config = app
+            .mapping_draft
+            .clone()
+            .or(app.active_config.clone())
+            .unwrap_or_else(|| DrumKitConfiguration::new(&device));
+        let mut enabled = config.hi_hat_pedal.is_some();
+        if ui
+            .checkbox(
+                &mut enabled,
+                "Use pedal position for open / closed hi-hat (shared stick notes)",
+            )
+            .changed()
+        {
+            config.hi_hat_pedal = enabled.then(HiHatPedalMode::default);
+        }
+        if enabled {
+            ui.weak("Learn the stick zones once at Hi-Hat Closed (Use + Add Another for the edge). The Open step is automatic. Learn the foot hit and pedal position separately.");
+        }
+        app.mapping_draft = Some(config.clone());
         ui.add_space(16.0);
         if ui
             .add_sized([180.0, 40.0], egui::Button::new("Start Setup"))
             .clicked()
         {
-            let mut wizard = app
-                .active_config
-                .clone()
-                .map(SetupWizard::with_existing)
-                .unwrap_or_default();
+            let mut wizard = SetupWizard::with_existing(config);
             wizard.start_after(app.clock.now_micros());
             app.wizard = Some(wizard);
             app.wizard_device = Some(device);
@@ -49,6 +67,24 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
         Finish,
     }
     let mut action = Action::None;
+    if let Some(wizard) = app.wizard.as_mut().filter(|wizard| {
+        wizard.state() == SetupWizardState::Detecting(DrumComponent::Crash)
+            && wizard.detected_hit().is_none()
+    }) {
+        let mut enabled = wizard.uses_pedal_position();
+        if ui
+            .checkbox(
+                &mut enabled,
+                "Use pedal position for open / closed hi-hat (shared stick notes)",
+            )
+            .changed()
+        {
+            wizard.set_hi_hat_pedal_mode(&device, enabled.then(HiHatPedalMode::default));
+        }
+        if enabled {
+            ui.weak("Learn hi-hat bow and edge once at the Closed step. Open is derived from pedal position; learn the foot hit and controller separately.");
+        }
+    }
     let latest = app.wizard_last_input.clone();
     let interpreted = app.wizard.as_ref().and_then(|wizard| {
         wizard
@@ -490,6 +526,8 @@ fn finish_wizard(app: &mut DrumApp, device: &str) {
         config.mapped_count()
     );
     app.active_config = Some(config);
+    app.midi_input_resolver.reset();
+    app.rebuild_timeline();
     app.wizard = None;
     app.wizard_device = None;
     app.wizard_last_input = None;

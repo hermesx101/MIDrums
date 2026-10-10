@@ -144,8 +144,10 @@ and preservation of a baseline mapping separately.
 Follow this path:
 
 ```text
-DrumApp::handle_practice_midi_event
-  -> ActualHit::from_midi_event_observed_at
+DrumApp::drain_events
+  -> MidiInputResolver::observe
+  -> DrumApp::handle_practice_midi_event / MidiInputResolver::resolve
+  -> ActualHit::from_resolved_midi_event_observed_at
   -> MIDI latency compensation
   -> PracticeSession::record_hit / advance_to_tick
   -> PracticeResult

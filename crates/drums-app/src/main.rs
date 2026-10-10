@@ -34,7 +34,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use drums_core::mapping::{
-    DrumKitConfiguration, MappingStore, ObservedMidiInput, SetupWizard, SUPPORTED_COMPONENTS,
+    DrumKitConfiguration, MappingStore, MidiInputResolver, ObservedMidiInput, SetupWizard,
+    SUPPORTED_COMPONENTS,
 };
 use drums_core::time::{SharedClock, SystemClock};
 use drums_core::{
@@ -151,6 +152,7 @@ struct DrumApp {
     store: MappingStore,
     /// The configuration currently active for the connected device.
     active_config: Option<DrumKitConfiguration>,
+    midi_input_resolver: MidiInputResolver,
     /// Setup wizard state, present while a setup run is in progress.
     wizard: Option<SetupWizard>,
     /// Name of the device the running wizard was started against.
@@ -167,6 +169,8 @@ struct DrumApp {
     /// Last meaningful hit shown by Drum Mapping; Note Off never replaces it.
     mapping_last_input: Option<MidiEvent>,
     mapping_last_detected_component: Option<drums_core::DrumComponent>,
+    /// Last played drum, retained when pedal/controller updates follow a hit.
+    mapping_last_note_component: Option<drums_core::DrumComponent>,
     /// Currently selected view/tab.
     view: View,
     imported_midi: Option<MidiFile>,
@@ -265,6 +269,8 @@ impl DrumApp {
         self.connected = false;
         self.events.clear();
         self.active_config = None;
+        self.midi_input_resolver.reset();
+        self.mapping_last_note_component = None;
         self.wizard = None;
         self.wizard_device = None;
         self.wizard_last_input = None;
@@ -502,6 +508,7 @@ impl DrumApp {
             frames: 0,
             store,
             active_config: None,
+            midi_input_resolver: MidiInputResolver::default(),
             wizard: None,
             wizard_device: None,
             wizard_last_input: None,
@@ -514,6 +521,7 @@ impl DrumApp {
             mapping_reassign_started: None,
             mapping_last_input: None,
             mapping_last_detected_component: None,
+            mapping_last_note_component: None,
             view: if needs_initial_setup {
                 View::Setup
             } else {
@@ -591,6 +599,9 @@ impl DrumApp {
         let observed_at_micros = self.clock.now_micros();
         self.forward_events_to_setup_wizard(&new_events);
         for event in new_events {
+            if let Some(config) = self.active_config.as_ref().or(self.mapping_draft.as_ref()) {
+                self.midi_input_resolver.observe(&event, config);
+            }
             self.update_mapping_diagnostics(&event);
             self.handle_practice_midi_event(&event, observed_at_micros);
             self.events.insert(0, event);
@@ -614,14 +625,17 @@ impl DrumApp {
     }
 
     fn update_mapping_diagnostics(&mut self, event: &MidiEvent) {
-        let Some(input) = ObservedMidiInput::from_event(event) else {
+        let Some(_) = ObservedMidiInput::from_event(event) else {
             return;
         };
         self.mapping_last_input = Some(event.clone());
         self.mapping_last_detected_component = self
             .active_config
             .as_ref()
-            .and_then(|config| config.resolve(input.identity()));
+            .and_then(|config| self.midi_input_resolver.resolve(event, config));
+        if event.message.kind == drums_core::MessageKind::NoteOn {
+            self.mapping_last_note_component = self.mapping_last_detected_component;
+        }
     }
 
     fn handle_practice_midi_event(&mut self, event: &MidiEvent, observed_at_micros: u64) {
@@ -634,9 +648,12 @@ impl DrumApp {
         let Some(transport) = self.transport.as_ref() else {
             return;
         };
-        let Some(mut hit) =
-            ActualHit::from_midi_event_observed_at(event, config, transport, observed_at_micros)
-        else {
+        let Some(mut hit) = ActualHit::from_resolved_midi_event_observed_at(
+            event,
+            self.midi_input_resolver.resolve(event, config),
+            transport,
+            observed_at_micros,
+        ) else {
             return;
         };
         hit.elapsed_seconds =
@@ -683,6 +700,8 @@ impl DrumApp {
                     Err(error) => (None, Some(error)),
                 };
                 self.active_config = stored.clone();
+                self.midi_input_resolver.reset();
+                self.mapping_last_note_component = None;
                 self.mapping_draft = None;
                 self.status = if let Some(error) = mapping_load_error {
                     format!(
@@ -721,6 +740,8 @@ impl DrumApp {
         self.connected = false;
         self.events.clear();
         self.active_config = None;
+        self.midi_input_resolver.reset();
+        self.mapping_last_note_component = None;
         self.wizard = None;
         self.wizard_device = None;
         self.wizard_last_input = None;
@@ -1022,6 +1043,8 @@ impl eframe::App for DrumApp {
                 self.connected = false;
                 self.events.clear();
                 self.active_config = None;
+                self.midi_input_resolver.reset();
+                self.mapping_last_note_component = None;
                 self.wizard = None;
                 self.wizard_device = None;
                 self.mapping_draft = None;

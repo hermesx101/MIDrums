@@ -14,6 +14,7 @@ MI Drums runs locally and does not require a server or cloud account.
 - Guided Setup Wizard and Drum Mapping
 - Multiple MIDI inputs per logical drum
 - Closed/open hi-hat and pedal mapping
+- Optional [pedal-position hi-hat mode](SHARED_HI_HAT.md) for kits with shared open/closed stick notes
 - MIDI Track Library and MIDI import
 - Practice mode with tempo, count-in, loops, and lookahead
 - Real-time Timeline and drum feedback

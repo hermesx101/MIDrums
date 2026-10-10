@@ -25,8 +25,8 @@
 //!   the previous pad cannot slide into the *next* component's prompt.
 
 use super::{
-    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingEventKind,
-    MappingInputIdentity, ObservedMidiInput, SUPPORTED_COMPONENTS,
+    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, HiHatPedalMode, MappingEventKind,
+    MappingInputIdentity, MidiInputResolver, ObservedMidiInput, SUPPORTED_COMPONENTS,
 };
 use crate::midi::MidiEvent;
 
@@ -121,6 +121,7 @@ pub struct SetupWizard {
     /// Saved configuration used only for conflict protection and preserving
     /// skipped components during a later re-run of setup.
     base_config: Option<DrumKitConfiguration>,
+    test_resolver: MidiInputResolver,
 }
 
 impl Default for SetupWizard {
@@ -146,6 +147,7 @@ impl SetupWizard {
             test_hit: None,
             test_component: None,
             base_config: None,
+            test_resolver: MidiInputResolver::default(),
         }
     }
 
@@ -163,6 +165,7 @@ impl SetupWizard {
 
     /// Starts fresh and rejects every event at or before `boundary_micros`.
     pub fn start_after(&mut self, boundary_micros: u64) {
+        self.test_resolver.reset();
         self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[0]);
         self.index = 0;
         self.detected = None;
@@ -179,6 +182,7 @@ impl SetupWizard {
 
     /// Cancels the run and discards everything collected so far.
     pub fn cancel(&mut self) {
+        self.test_resolver.reset();
         self.state = SetupWizardState::Canceled;
         self.detected = None;
         self.conflicting.clear();
@@ -322,6 +326,17 @@ impl SetupWizard {
         };
         if self.state == SetupWizardState::Completed {
             self.test_hit = Some(hit);
+            if self.uses_pedal_position() {
+                let device = self
+                    .base_config
+                    .as_ref()
+                    .map(|config| config.device_name.as_str())
+                    .unwrap_or("");
+                if let Some(config) = self.configuration(device) {
+                    self.test_component = self.test_resolver.observe(ev, &config);
+                }
+                return true;
+            }
             self.test_component =
                 self.accepted.iter().flatten().find_map(|mapping| {
                     mapping.matches(hit.identity()).then_some(mapping.component)
@@ -493,6 +508,11 @@ impl SetupWizard {
             return false;
         }
         self.index -= 1;
+        if self.uses_pedal_position()
+            && SUPPORTED_COMPONENTS[self.index] == DrumComponent::HiHatOpen
+        {
+            self.index -= 1;
+        }
         self.accepted[self.index].clear();
         self.handled[self.index] = false;
         self.detected = None;
@@ -546,11 +566,39 @@ impl SetupWizard {
         self.rejected = None;
         self.cc_range = None;
         self.index += 1;
+        if self.uses_pedal_position()
+            && SUPPORTED_COMPONENTS.get(self.index) == Some(&DrumComponent::HiHatOpen)
+        {
+            self.handled[self.index] = true;
+            self.index += 1;
+        }
         if self.index >= SUPPORTED_COMPONENTS.len() {
             self.state = SetupWizardState::Completed;
         } else {
             self.state = SetupWizardState::Detecting(SUPPORTED_COMPONENTS[self.index]);
         }
+    }
+
+    pub fn uses_pedal_position(&self) -> bool {
+        self.base_config
+            .as_ref()
+            .is_some_and(|config| config.hi_hat_pedal.is_some())
+    }
+
+    /// Select the shared-note mode before the first input is learned.
+    pub fn set_hi_hat_pedal_mode(&mut self, device: &str, mode: Option<HiHatPedalMode>) -> bool {
+        if self.index != 0
+            || self.detected.is_some()
+            || self.accepted.iter().any(|inputs| !inputs.is_empty())
+        {
+            return false;
+        }
+        let config = self
+            .base_config
+            .get_or_insert_with(|| DrumKitConfiguration::new(device));
+        config.hi_hat_pedal = mode;
+        self.test_resolver.reset();
+        true
     }
 }
 

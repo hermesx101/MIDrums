@@ -83,6 +83,7 @@ crates/
       mapping/
         mod.rs
         store.rs
+        resolver.rs
         wizard.rs
       practice.rs
       performance.rs
@@ -123,6 +124,7 @@ Files/
 | `midi/metronome.rs` | Subdivision suggestion, count grid, and transport-boundary click events. |
 | `mapping/mod.rs` | Logical drums, physical input identities, mappings, aliases, conflicts, CC calibration, and resolution. |
 | `mapping/store.rs` | Per-device TOML mapping persistence. |
+| `mapping/resolver.rs` | Ordered pedal state and optional shared-note hi-hat interpretation. |
 | `mapping/wizard.rs` | GUI-independent Setup Wizard state machine. |
 | `practice.rs` | Actual-hit conversion, continuous pedal state, expected-target lifecycle, matching, and result creation. |
 | `performance.rs` | Live/attempt-level aggregate statistics derived from a `PracticeSession`. |
@@ -195,9 +197,9 @@ Hi-hat behavior is represented by four logical components:
 
 Closed, open, and discrete pedal mappings are ordinary Note aliases and can produce `ActualHit` values. Continuous pedal position is different: Setup or Drum Mapping records the controller number, channel, and observed `CcRange`. `PracticeSession::update_hi_hat_pedal_state` normalizes a matching CC value into `0.0..=1.0` and records the latest raw value/timestamp as `HiHatPedalState`.
 
-The continuous CC path never calls `record_hit`. It therefore cannot create Correct, Extra, or any other scored result and does not suppress a separate discrete pedal Note. The current expected-note model does not use pedal position to infer open/closed articulation; that is an explicit limitation rather than hidden behavior.
+The continuous CC path never calls `record_hit`. It therefore cannot create Correct, Extra, or any other scored result and does not suppress a separate discrete pedal Note. For profiles with the optional `hi_hat_pedal` mode, `MidiInputResolver` holds the most recent mapped pedal CC on each channel and classifies shared stick inputs as Closed or Open using a configurable raw threshold and direction. A discrete foot input retains its own component. Missing pedal state produces an unknown stick target; held state does not expire. Reconnect, disconnect, profile save and application reset clear the resolver. The GUI drains events in callback order and resolves each one before scoring; a later CC cannot reclassify an earlier hit.
 
-Standalone notation recognizes General MIDI 42 as closed hi-hat, 44 as pedal, and 46 as open. The current Practice expected-note conversion groups 42/44/46 as general `HiHat`, so the two paths should not be assumed to have identical articulation detail.
+Standalone notation recognizes General MIDI 42 as closed hi-hat, 44 as pedal, and 46 as open. With `hi_hat_pedal` enabled, Practice preserves those three musical roles and makes both stick targets available from shared inputs. Legacy profiles continue grouping 42/44/46 as general `HiHat`. See [SHARED_HI_HAT.md](SHARED_HI_HAT.md) for setup and the measured V51/VH-14D example.
 
 ## 6. Setup Wizard
 
@@ -207,8 +209,8 @@ The wizard progresses through `SUPPORTED_COMPONENTS`. All playable components li
 
 Each accepted component can retain multiple Note aliases. A wizard created with an existing configuration protects its inputs from accidental reuse and preserves skipped baseline components. At completion, the UI builds and validates the configuration, saves it through `MappingStore`, then marks the wizard finished and makes the saved configuration active.
 
-The fixed wizard order is Crash, Ride, Hi-Hat, Open Hi-Hat, Hi-Hat Pedal, Hi-Hat Pedal Position,
-Snare, Kick, High Tom, Mid Tom, and Low Tom. Playable components detect positive-velocity Note On;
+The default wizard order is Crash, Ride, Hi-Hat, Open Hi-Hat, Hi-Hat Pedal, Hi-Hat Pedal Position,
+Snare, Kick, High Tom, Mid Tom, and Low Tom. In shared-note mode, stick zones are learned once at Hi-Hat and the Open Hi-Hat step is skipped; its review uses the same ordered pedal resolver. Playable components detect positive-velocity Note On;
 Hi-Hat Pedal Position detects CC and accumulates its observed minimum/maximum for calibration.
 
 ```text
@@ -234,7 +236,7 @@ the prior step or a flam/double trigger from being accepted for the next prompt.
 
 `MidiFile::expected_notes_for_track` creates the expected side of practice. `DrumApp::rebuild_timeline` uses those same notes for `PracticeSession`, Timeline, notation, and automatic subdivision suggestion.
 
-On the actual side, `DrumApp` first updates continuous hi-hat state for CC events. Positive-velocity Note On events are converted by `ActualHit::from_midi_event_observed_at`. This conversion resolves the event through the active mapping, subtracts measured GUI queue delay, applies the configured MIDI input-latency compensation, and calculates an effective transport tick.
+On the actual side, `DrumApp` first updates continuous hi-hat state for CC events. Positive-velocity Note On events are converted by `ActualHit::from_resolved_midi_event_observed_at` using the logical component from the ordered resolver. The conversion preserves callback timestamps and subtracts measured GUI queue delay; the application then applies MIDI input-latency compensation and recalculates the effective tick. The stateless `from_midi_event_observed_at` entry point remains available for ordinary mappings.
 
 While the transport is playing and count-in is inactive, the hit is passed to `PracticeSession::record_hit`. Separately, transport advancement calls `advance_to_tick` to finalize misses after their late boundary. Stop/seek reset or reposition matching state; loop wraps finalize/rearm the loop region and retain accumulated results.
 

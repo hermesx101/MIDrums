@@ -46,12 +46,27 @@ impl ActualHit {
         transport: &MusicalTransport,
         observed_at_micros: u64,
     ) -> Option<Self> {
+        Self::from_resolved_midi_event_observed_at(
+            event,
+            mapping.resolve_drum_from_midi_event(event),
+            transport,
+            observed_at_micros,
+        )
+    }
+
+    /// Builds a hit from a logical component already resolved in MIDI order,
+    /// including optional pedal-derived hi-hat articulation.
+    pub fn from_resolved_midi_event_observed_at(
+        event: &MidiEvent,
+        component: Option<DrumComponent>,
+        transport: &MusicalTransport,
+        observed_at_micros: u64,
+    ) -> Option<Self> {
         if event.message.kind != MessageKind::NoteOn || event.message.velocity().unwrap_or(0) == 0 {
             return None;
         }
         let note = event.message.note()?;
         let channel = event.message.channel?;
-        let component = mapping.resolve_drum_from_midi_event(event);
         let queue_delay_seconds =
             observed_at_micros.saturating_sub(event.timestamp_micros) as f64 / 1_000_000.0;
         let elapsed_seconds = (transport.elapsed_seconds() - queue_delay_seconds).max(0.0);

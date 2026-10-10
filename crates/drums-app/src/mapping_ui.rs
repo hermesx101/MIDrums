@@ -1,7 +1,8 @@
 //! Transactional manual reassignment for Note and CC MIDI identities.
 
 use drums_core::mapping::{
-    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, MappingEventKind, ObservedMidiInput,
+    CcRange, DrumComponent, DrumKitConfiguration, DrumMapping, HiHatPedalMode, MappingEventKind,
+    ObservedMidiInput,
 };
 use drums_core::MidiEvent;
 use eframe::egui;
@@ -28,8 +29,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     let latest = app.mapping_last_input.clone();
     app.mapping_last_detected_component = latest
         .as_ref()
-        .and_then(ObservedMidiInput::from_event)
-        .and_then(|input| draft.resolve(input.identity()));
+        .and_then(|event| app.midi_input_resolver.resolve(event, &draft));
     if app.mapping_reassign_component.is_some() && app.mapping_reassign_candidate.is_none() {
         if let Some(event) = latest.as_ref().filter(|event| {
             event.timestamp_micros > app.mapping_reassign_after_micros
@@ -81,6 +81,17 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     egui::Frame::group(ui.style())
         .inner_margin(12.0)
         .show(ui, |ui| {
+            let mut enabled = draft.hi_hat_pedal.is_some();
+            if ui.checkbox(&mut enabled, "Use pedal position for open / closed hi-hat").changed() {
+                draft.hi_hat_pedal = enabled.then(HiHatPedalMode::default);
+            }
+            if let Some(mode) = draft.hi_hat_pedal.as_mut() {
+                ui.add(egui::Slider::new(&mut mode.closed_threshold, 0..=127).text("Closed pedal threshold"));
+                ui.checkbox(&mut mode.high_values_closed, "Higher pedal values mean closed");
+                ui.weak("Map each stick zone once under Hi-Hat. Open and closed use those same inputs. Map the pedal controller and the foot hit separately.");
+                ui.weak("After connecting or saving, move the pedal once before playing. Intermediate positions on the open side of the threshold count as open.");
+                ui.separator();
+            }
             for component in [
                 DrumComponent::HiHatOpen,
                 DrumComponent::HiHatPedal,
@@ -115,6 +126,7 @@ pub fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
             match app.store.save(&draft) {
                 Ok(()) => {
                     app.active_config = Some(draft.clone());
+                    app.midi_input_resolver.reset();
                     app.status = "Drum mapping saved.".into();
                     app.rebuild_timeline();
                 }

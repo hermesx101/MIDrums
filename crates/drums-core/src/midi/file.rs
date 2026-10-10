@@ -316,13 +316,24 @@ impl MidiFile {
                 velocity: note.velocity,
                 channel: note.channel,
                 track: note.track,
-                drum_component: general_midi_component(note.midi_note),
-                target_component: general_midi_component(note.midi_note).filter(|component| {
-                    mapping.is_some_and(|config| config.get(*component).is_some())
+                drum_component: lesson_component(note.midi_note, mapping),
+                target_component: lesson_component(note.midi_note, mapping).filter(|component| {
+                    mapping.is_some_and(|config| config.supports_component(*component))
                 }),
             })
             .collect()
     }
+}
+
+fn lesson_component(note: u8, mapping: Option<&DrumKitConfiguration>) -> Option<DrumComponent> {
+    if mapping.is_some_and(|config| config.hi_hat_pedal.is_some()) {
+        match note {
+            44 => return Some(DrumComponent::HiHatPedal),
+            46 => return Some(DrumComponent::HiHatOpen),
+            _ => {}
+        }
+    }
+    general_midi_component(note)
 }
 
 /// Interprets the common General MIDI percussion notes supported by MI Drums.

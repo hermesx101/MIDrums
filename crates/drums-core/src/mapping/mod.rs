@@ -8,6 +8,7 @@
 //! the values are learned from the connected device during the setup wizard, or
 //! typed by hand in the manual mapping view.
 
+mod resolver;
 mod store;
 mod wizard;
 
@@ -15,6 +16,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use resolver::{HiHatPedalMode, MidiInputResolver};
 pub use store::MappingStore;
 pub use wizard::{DetectedHit, SetupWizard, SetupWizardState};
 
@@ -354,6 +356,9 @@ pub struct MappingConflict {
 pub struct DrumKitConfiguration {
     pub device_name: String,
     pub mappings: Vec<DrumMapping>,
+    /// Opt-in interpretation of shared hi-hat stick notes using pedal CC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi_hat_pedal: Option<HiHatPedalMode>,
 }
 
 impl DrumKitConfiguration {
@@ -362,12 +367,29 @@ impl DrumKitConfiguration {
         Self {
             device_name: device_name.into(),
             mappings: Vec::new(),
+            hi_hat_pedal: None,
         }
     }
 
     /// Returns the first mapping for a component, if one exists.
     pub fn get(&self, component: DrumComponent) -> Option<&DrumMapping> {
         self.mappings.iter().find(|m| m.component == component)
+    }
+
+    /// Shared stick inputs can produce both open and closed musical targets.
+    pub fn supports_component(&self, component: DrumComponent) -> bool {
+        if self.hi_hat_pedal.is_some()
+            && matches!(component, DrumComponent::HiHat | DrumComponent::HiHatOpen)
+        {
+            return self.mappings.iter().any(|mapping| {
+                mapping.event_kind == MappingEventKind::Note
+                    && matches!(
+                        mapping.component,
+                        DrumComponent::HiHat | DrumComponent::HiHatOpen
+                    )
+            });
+        }
+        self.get(component).is_some()
     }
 
     /// Returns every physical MIDI alias assigned to a logical component.
@@ -471,6 +493,37 @@ impl DrumKitConfiguration {
 
     /// Checks persisted/input invariants without modifying the configuration.
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .hi_hat_pedal
+            .is_some_and(|mode| mode.closed_threshold > 127)
+        {
+            return Err("Hi-hat closed threshold must be in 0..=127".into());
+        }
+        if self.hi_hat_pedal.is_some() {
+            for stick in self.mappings.iter().filter(|mapping| {
+                mapping.event_kind == MappingEventKind::Note
+                    && matches!(
+                        mapping.component,
+                        DrumComponent::HiHat | DrumComponent::HiHatOpen
+                    )
+            }) {
+                let controllers = self
+                    .mappings
+                    .iter()
+                    .filter(|mapping| {
+                        mapping.event_kind == MappingEventKind::ControlChange
+                            && mapping.component == DrumComponent::HiHatPedalPosition
+                            && mapping.channel == stick.channel
+                    })
+                    .count();
+                if controllers != 1 {
+                    return Err(format!(
+                        "Map exactly one hi-hat pedal CC on channel {} first",
+                        stick.channel
+                    ));
+                }
+            }
+        }
         for (index, mapping) in self.mappings.iter().enumerate() {
             if !(1..=16).contains(&mapping.channel) {
                 return Err(format!("mapping {} has invalid MIDI channel", index + 1));

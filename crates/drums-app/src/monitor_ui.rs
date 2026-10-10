@@ -47,6 +47,23 @@ pub(crate) fn show(app: &mut DrumApp, ui: &mut egui::Ui) {
     }
     ui.separator();
     ui.heading("Latest event");
+    ui.horizontal(|ui| {
+        ui.strong("Last played drum");
+        ui.label(
+            app.mapping_last_note_component
+                .map(|component| component.label())
+                .unwrap_or("Waiting for a mapped hit"),
+        );
+    });
+    if app
+        .active_config
+        .as_ref()
+        .is_some_and(|config| config.hi_hat_pedal.is_some())
+    {
+        ui.weak(
+            "Move the pedal once after connecting to initialize the open / closed hi-hat state.",
+        );
+    }
     ui.separator();
 
     if let Some(latest) = app.events.first() {
