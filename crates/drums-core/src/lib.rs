@@ -16,9 +16,9 @@ pub mod time;
 
 pub use audio_sync::{audio_position, compensate_midi_input, looped_audio_position};
 pub use mapping::{
-    CcRange, DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, MappingArticulation,
-    MappingConflict, MappingEventKind, MappingInputIdentity, MappingStore, ObservedMidiInput,
-    SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
+    CcRange, DetectedHit, DrumComponent, DrumKitConfiguration, DrumMapping, HiHatPedalMode,
+    MappingArticulation, MappingConflict, MappingEventKind, MappingInputIdentity, MappingStore,
+    MidiInputResolver, ObservedMidiInput, SetupWizard, SetupWizardState, SUPPORTED_COMPONENTS,
 };
 pub use midi::{
     count_tokens, general_midi_component, suggest_subdivision, ClickKind, CountToken, ExpectedNote,
